@@ -24,7 +24,6 @@ pub fn app_background(visuals: AppVisuals, content: impl IntoElement) -> impl In
 
 /// Fondo neutro para el panel administrativo (Dashboard, Consumos, Caja, Reportes):
 /// lienzo limpio del tema + patrón de cubiertos pequeños muy sutil (3%).
-#[allow(dead_code)]
 pub fn app_workspace_background(theme: &DylanTheme, content: impl IntoElement) -> impl IntoElement {
     let visuals = theme.visuals();
 

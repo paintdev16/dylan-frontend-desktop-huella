@@ -25,6 +25,12 @@ Lee la etapa aplicable de [PLAN_IMPLEMENTACION.md](../../../PLAN_IMPLEMENTACION.
 - Implementa el formulario de Acceso con la cuenta de demostración prevista en el plan. Si las credenciales son inválidas, muestra el error en Acceso. Si son válidas, abre Dashboard. Al cerrar sesión, vuelve a Acceso y comprueba que Dashboard queda inaccesible hasta autenticarse otra vez.
 - Habilita rutas adicionales cuando sus flujos estén disponibles. Los enlaces y pantallas de registro de cuentas y recuperación de contraseña pertenecen a una etapa posterior.
 
+## Configuración y preferencias (Etapa 4)
+
+- Implementa `src/features/settings/` y `src/services/preferences.rs` para persistir preferencias locales no sensibles: tema (`Sistema / Claro / Oscuro`), correo de **Recordarme** y parámetros de estación (como la URL base del servidor si es configurable).
+- Guarda el archivo de preferencias en el directorio de datos de usuario del sistema operativo (fuera del directorio de instalación que sobrescribe Velopack al actualizar) y recárgalo al iniciar sin bloquear la interfaz.
+- Nunca guardes contraseñas, tokens de sesión, claves de firma ni datos biométricos en el archivo de preferencias.
+
 ## Verificación
 
 Ejecuta `cargo fmt --check` y `cargo check` desde la raíz. Cuando puedas abrir la app con `cargo run`, verifica inicio en Acceso, credenciales inválidas, ingreso válido y cierre de sesión. Indica en el resultado cualquier comprobación de ventana que haya quedado pendiente.

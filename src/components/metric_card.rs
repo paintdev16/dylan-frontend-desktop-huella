@@ -59,7 +59,8 @@ impl RenderOnce for MetricCard {
 
         v_flex()
             .flex_1()
-            .min_w(px(180.0))
+            .min_w(px(190.0))
+            .max_w_full()
             .p(Spacing::LG)
             .gap(Spacing::SM)
             .rounded(Radii::LG)

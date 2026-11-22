@@ -7,6 +7,7 @@ mod app;
 mod components;
 mod features;
 mod services;
+mod state;
 mod theme;
 
 use gpui_kit::{component::TitleBar, *};
@@ -26,7 +27,7 @@ fn main() {
         {
             options.window_decorations = Some(WindowDecorations::Client);
         }
-        options.window_min_size = Some(size(px(720.0), px(460.0)));
+        options.window_min_size = Some(size(px(360.0), px(360.0)));
         if let Some(titlebar) = &mut options.titlebar {
             titlebar.title = Some("Comedor Dylan".into());
         }

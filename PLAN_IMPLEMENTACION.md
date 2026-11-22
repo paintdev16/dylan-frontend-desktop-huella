@@ -52,7 +52,7 @@ src/
 
 - [ ] Probar una actualización de Velopack con dos versiones de la ventana de demostración en Windows x64 y Linux x64. Comprobar que el borrador queda invisible, que la app detecta la versión al publicarla y que vuelve a iniciar después de actualizar. El flujo está descrito en [README.md](README.md).
 - [ ] Probar SecuGen en Windows con el lector objetivo. Comprobar apertura, captura, cancelación y recuperación tras desconectar y reconectar. Anotar las restricciones observadas del SDK para la etapa 5.
-- [ ] Acordar qué devuelve el backend al confirmar una atención, cómo se identifica un reintento mediante una clave de idempotencia y cómo se consulta una confirmación si se pierde la respuesta. Usar el acuerdo como entrada para el adaptador HTTP de la etapa 6.
+- [ ] Acordar con el backend el contrato de autenticación (login, tokens/refresh, usuario, roles/permisos y errores `401`/`403`), qué devuelve al confirmar una atención, cómo se identifica un reintento mediante una clave de idempotencia y cómo se consulta una confirmación si se pierde la respuesta. Usar ambos acuerdos como entrada para los adaptadores HTTP de la etapa 6.
 
 ### 3. Atención automática, Consumos y Caja
 
@@ -66,7 +66,7 @@ src/
 ### 4. Dashboard, Reportes y Configuración
 
 - [ ] Conectar Dashboard y Reportes a los mismos registros de demostración que Consumos y Caja. Mostrar consumos, raciones y tickets con filtros por fecha.
-- [ ] Crear `features/settings/` y `services/preferences.rs` para guardar el tema y las preferencias de la estación que requiera la aplicación.
+- [ ] Crear `features/settings/` y `services/preferences.rs` para guardar el tema, el correo de **Recordarme** (datos no sensibles) y las preferencias de la estación que requiera la aplicación (como la URL base del servidor si es configurable), fuera del directorio que reemplaza Velopack.
 
 **Aceptación.** Usar un solo caso de prueba: abrir caja, registrar un consumo con tickets y consultar el mismo periodo en todos los módulos. Consumos muestra la atención, Caja muestra un abono por la cantidad correcta de tickets, la ficha del pensionista refleja el saldo resultante y Dashboard y Reportes coinciden con esos registros. Las preferencias guardadas se recuperan al reiniciar. Con esta etapa queda completa la demostración funcional.
 
@@ -79,10 +79,11 @@ src/
 
 ### 6. Backend y confirmación persistente
 
+- [ ] Implementar la autenticación real en `services/api/auth.rs` y conectar `features/auth/` y `state/session.rs` fuera del hilo de interfaz. Deshabilitar **Ingresar** con estado de carga mientras responde el servidor, retirar la cuenta de demostración, guardar tokens y permisos reales en sesión, diferenciar errores de credenciales (`401`/`403`) de errores de red y cerrar sesión si el token expira. Si **Recordarme** mantiene sesión entre reinicios, custodiar el token en el llavero seguro del sistema operativo y nunca en texto plano.
 - [ ] Completar los contratos de sesión, pensionistas, caja y consultas. Implementar en `services/api/` los adaptadores HTTP y el contrato de confirmación acordado en las validaciones tempranas.
 - [ ] Hacer que el backend valide permisos y confirme el registro de negocio. Consultar el resultado de una confirmación incierta y reutilizar su clave de idempotencia si se reintenta.
 
-**Aceptación.** El registro persiste tras reiniciar. Una respuesta perdida permite recuperar el resultado o reintentar sin duplicar el movimiento. El servidor rechaza operaciones sin permiso.
+**Aceptación.** El inicio de sesión valida contra el backend sin congelar la ventana, muestra errores diferenciados de credenciales o red y devuelve a Acceso cuando expira la sesión. El registro persiste tras reiniciar. Una respuesta perdida permite recuperar el resultado o reintentar sin duplicar el movimiento. El servidor rechaza operaciones sin permiso.
 
 ### 7. Distribución y actualizaciones en Windows y Linux con Velopack
 

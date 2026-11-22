@@ -40,6 +40,9 @@ pub fn app_title_bar(
     let show_window_controls = cfg!(target_os = "windows")
         || (cfg!(target_os = "linux")
             && matches!(window.window_decorations(), Decorations::Client { .. }));
+    let viewport_width = window.viewport_size().width;
+    let compact = viewport_width < px(540.0);
+    let show_version = viewport_width >= px(430.0);
 
     h_flex()
         .id("app-title-bar")
@@ -54,10 +57,12 @@ pub fn app_title_bar(
             h_flex()
                 .id("app-title-bar-drag")
                 .flex_1()
+                .min_w_0()
+                .overflow_hidden()
                 .h_full()
                 .items_center()
                 .gap(Spacing::SM)
-                .pl(Spacing::LG)
+                .pl(if compact { Spacing::MD } else { Spacing::LG })
                 .pr(Spacing::SM)
                 .window_control_area(WindowControlArea::Drag)
                 .when(cfg!(target_os = "linux"), |this| {
@@ -71,24 +76,38 @@ pub fn app_title_bar(
                 })
                 .child(brand_tile(visuals, px(22.0)))
                 .child(
-                    Label::new(title)
-                        .text_size(Typography::LG)
-                        .font_semibold()
-                        .text_color(palette.foreground),
-                )
-                .child(
                     div()
-                        .px(Spacing::MD)
-                        .py(Spacing::XS)
-                        .rounded(Radii::FULL)
-                        .bg(visuals.version_background)
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .child(
-                            Label::new(format!("v{version}"))
-                                .text_size(Typography::BASE)
+                            Label::new(title)
+                                .text_size(if compact {
+                                    Typography::BASE
+                                } else {
+                                    Typography::LG
+                                })
                                 .font_semibold()
-                                .text_color(visuals.version_foreground),
+                                .text_color(palette.foreground),
                         ),
-                ),
+                )
+                .when(show_version, |this| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .px(Spacing::MD)
+                            .py(Spacing::XS)
+                            .rounded(Radii::FULL)
+                            .bg(visuals.version_background)
+                            .child(
+                                Label::new(format!("v{version}"))
+                                    .text_size(Typography::BASE)
+                                    .font_semibold()
+                                    .text_color(visuals.version_foreground),
+                            ),
+                    )
+                }),
         )
         .child(
             h_flex()
@@ -99,20 +118,24 @@ pub fn app_title_bar(
                 .gap(Spacing::SM)
                 .pr(Spacing::SM)
                 .when_some(update_slot, |slot, child| slot.child(child))
-                .child(theme_dropdown(current_theme, theme_store)),
+                .child(theme_dropdown(current_theme, theme_store, compact)),
         )
         .when(show_window_controls, |this| {
             this.child(window_controls(window, cx))
         })
 }
 
-fn theme_dropdown(current: ThemePreference, theme_store: Entity<ThemeStore>) -> impl IntoElement {
+fn theme_dropdown(
+    current: ThemePreference,
+    theme_store: Entity<ThemeStore>,
+    compact: bool,
+) -> impl IntoElement {
     Button::new("theme-menu")
         .ghost()
         .small()
         .icon(current.icon())
-        .label(current.label())
-        .tooltip("Cambiar tema")
+        .when(!compact, |this| this.label(current.label()))
+        .tooltip(format!("Cambiar tema ({})", current.label()))
         .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
             menu = menu.check_side(Side::Right);
             for pref in ThemePreference::ALL {
