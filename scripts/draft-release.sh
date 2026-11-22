@@ -17,8 +17,14 @@ sha256sum --check --strict SHA256SUMS.txt
 
 releases=$(gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | [.id, .draft] | @tsv")
 if [[ -z $releases ]]; then
-  gh release create "$tag" --repo "$repo" --verify-tag --draft --latest=false --generate-notes
-  releases=$(gh api --paginate "repos/$repo/releases?per_page=100" --jq ".[] | select(.tag_name == \"$tag\") | [.id, .draft] | @tsv")
+  gh api "repos/$repo/git/ref/tags/$tag" >/dev/null
+  releases=$(gh api --method POST "repos/$repo/releases" \
+    -f tag_name="$tag" \
+    -f name="$tag" \
+    -F draft=true \
+    -F generate_release_notes=true \
+    -f make_latest=false \
+    --jq '[.id, .draft] | @tsv')
 fi
 IFS=$'\t' read -r release_id draft <<< "$releases"
 if [[ ! $release_id =~ ^[0-9]+$ || $draft != true ]]; then
