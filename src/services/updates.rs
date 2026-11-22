@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
 
 use velopack::{Error, UpdateCheck, UpdateInfo, UpdateManager, sources::GithubSource};
 
@@ -7,51 +7,36 @@ pub struct PendingUpdate {
     info: Box<UpdateInfo>,
 }
 
+impl PendingUpdate {
+    pub fn version(&self) -> &str {
+        &self.info.TargetFullRelease.Version
+    }
+}
+
 pub enum UpdateState {
     Unavailable,
     Current,
-    Busy(&'static str),
+    Checking,
     Available(Arc<PendingUpdate>),
+    Downloading(Arc<PendingUpdate>),
     Downloaded(Arc<PendingUpdate>),
+    Installing(Arc<PendingUpdate>),
     Restarting,
     Failed,
 }
 
-impl UpdateState {
-    pub fn message(&self) -> String {
-        match self {
-            Self::Unavailable => "Actualizaciones disponibles en la versión empaquetada.".into(),
-            Self::Current => "No hay una versión más reciente.".into(),
-            Self::Busy(message) => (*message).into(),
-            Self::Available(update) => {
-                format!(
-                    "Versión {} disponible.",
-                    update.info.TargetFullRelease.Version
-                )
-            }
-            Self::Downloaded(update) => format!(
-                "Versión {} lista para instalar.",
-                update.info.TargetFullRelease.Version
-            ),
-            Self::Restarting => "Reiniciando para instalar la actualización…".into(),
-            Self::Failed => "Falló la actualización. Vuelve a buscar para reintentar.".into(),
-        }
-    }
-}
-
-#[derive(Clone)]
 pub enum UpdateAction {
     Check(&'static str),
-    Download(Arc<PendingUpdate>),
+    Download(Arc<PendingUpdate>, Sender<i16>),
     Install(Arc<PendingUpdate>),
 }
 
 impl UpdateAction {
-    pub fn status(&self) -> &'static str {
+    pub fn pending_state(&self) -> UpdateState {
         match self {
-            Self::Check(_) => "Buscando actualizaciones…",
-            Self::Download(_) => "Descargando actualización…",
-            Self::Install(_) => "Preparando la instalación…",
+            Self::Check(_) => UpdateState::Checking,
+            Self::Download(update, _) => UpdateState::Downloading(update.clone()),
+            Self::Install(update) => UpdateState::Installing(update.clone()),
         }
     }
 
@@ -77,8 +62,10 @@ impl UpdateAction {
                     }
                 }
             }
-            Self::Download(update) => {
-                update.manager.download_updates(&update.info, None)?;
+            Self::Download(update, progress) => {
+                update
+                    .manager
+                    .download_updates(&update.info, Some(progress))?;
                 Ok(UpdateState::Downloaded(update))
             }
             Self::Install(update) => {

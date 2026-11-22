@@ -1,7 +1,15 @@
-mod app;
-mod services;
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
-use gpui_kit::{AppContext as _, WindowOptions, application, assets, init, open_window};
+mod app;
+mod components;
+mod features;
+mod services;
+mod theme;
+
+use gpui_kit::{component::TitleBar, *};
 
 fn main() {
     velopack::VelopackApp::build()
@@ -10,10 +18,31 @@ fn main() {
 
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
+        cx.bind_keys([KeyBinding::new("f5", app::CheckForUpdates, None)]);
 
-        open_window(WindowOptions::default(), cx, |_, cx| {
-            cx.new(app::DesktopApp::new)
+        let mut options = TitleBar::window_options();
+        #[cfg(target_os = "linux")]
+        {
+            options.window_decorations = Some(WindowDecorations::Client);
+        }
+        options.window_min_size = Some(size(px(720.0), px(460.0)));
+        if let Some(titlebar) = &mut options.titlebar {
+            titlebar.title = Some("Comedor Dylan".into());
+        }
+
+        open_window(options, cx, |window, cx| {
+            let shell = cx.new(|cx| app::DesktopApp::new(window, cx));
+            let shell_for_close = shell.clone();
+            window.on_window_should_close(cx, move |_, cx| shell_for_close.read(cx).can_close(cx));
+            shell
         })
         .expect("No se pudo abrir la ventana");
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.activate(true);
     });
 }

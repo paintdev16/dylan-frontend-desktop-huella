@@ -1,83 +1,89 @@
-use gpui_kit::component::{
-    button::{Button, ButtonVariants},
-    label::Label,
+use gpui_kit::{
+    component::{ActiveTheme as _, StyledExt as _, label::Label, v_flex},
+    *,
 };
-use gpui_kit::*;
 
-use crate::services::updates::{UpdateAction, UpdateState};
+use crate::{
+    components::title_bar::app_title_bar, features::updates::UpdateView, theme::ThemeStore,
+};
+
+actions!(desktop, [CheckForUpdates]);
 
 pub struct DesktopApp {
-    updates: UpdateState,
-    update_task: Option<Task<()>>,
+    focus: FocusHandle,
+    updates: Entity<UpdateView>,
+    updates_visible: bool,
+    theme: Entity<ThemeStore>,
+    _subscriptions: [Subscription; 2],
 }
 
 impl DesktopApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut app = Self {
-            updates: UpdateState::Unavailable,
-            update_task: None,
-        };
-        if let Some(repository) = option_env!("DYLAN_UPDATE_REPO") {
-            app.run_update_action(UpdateAction::Check(repository), cx);
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let updates = cx.new(UpdateView::new);
+        let theme = cx.new(|cx| ThemeStore::new(window, cx));
+        let observe_updates = cx.observe(&updates, |app, updates, cx| {
+            let visible = updates.read(cx).is_visible();
+            if app.updates_visible != visible {
+                app.updates_visible = visible;
+                cx.notify();
+            }
+        });
+        let observe_theme = cx.observe(&theme, |_, _, cx| cx.notify());
+
+        Self {
+            focus,
+            updates_visible: updates.read(cx).is_visible(),
+            updates,
+            theme,
+            _subscriptions: [observe_updates, observe_theme],
         }
-        app
     }
 
-    fn run_update_action(&mut self, action: UpdateAction, cx: &mut Context<Self>) {
-        self.updates = UpdateState::Busy(action.status());
-        cx.notify();
-
-        let work = cx.background_executor().spawn(async move { action.run() });
-        self.update_task = Some(cx.spawn(async move |this, cx| {
-            let state = work.await.unwrap_or_else(|error| {
-                eprintln!("Velopack: {error}");
-                UpdateState::Failed
-            });
-            let _ = this.update(cx, |app, cx| {
-                if matches!(state, UpdateState::Restarting) {
-                    cx.quit();
-                }
-                app.updates = state;
-                cx.notify();
-            });
-        }));
+    pub fn can_close(&self, cx: &App) -> bool {
+        !self.updates.read(cx).is_installing()
     }
 }
 
 impl Render for DesktopApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let action = match &self.updates {
-            UpdateState::Available(update) => {
-                Some(("Descargar", UpdateAction::Download(update.clone())))
-            }
-            UpdateState::Downloaded(update) => Some((
-                "Instalar y reiniciar",
-                UpdateAction::Install(update.clone()),
-            )),
-            UpdateState::Current | UpdateState::Failed => option_env!("DYLAN_UPDATE_REPO")
-                .map(|repo| ("Buscar actualizaciones", UpdateAction::Check(repo))),
-            _ => None,
-        };
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let update_slot = self
+            .updates_visible
+            .then(|| self.updates.clone().into_any_element());
+        let version = env!("CARGO_PKG_VERSION");
 
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .child(Label::new("Dylan · Comedor"))
-            .child(Label::new(concat!("Versión ", env!("CARGO_PKG_VERSION"))))
-            .child(Label::new(self.updates.message()))
-            .children(action.map(|(label, action)| {
-                Button::new("update-action")
-                    .primary()
-                    .label(label)
-                    .on_click(cx.listener(move |app, _, _, cx| {
-                        if !matches!(app.updates, UpdateState::Busy(_) | UpdateState::Restarting) {
-                            app.run_update_action(action.clone(), cx);
-                        }
-                    }))
+        v_flex()
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|app, _: &CheckForUpdates, _, cx| {
+                app.updates.update(cx, |updates, cx| updates.check(cx));
             }))
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(app_title_bar(
+                "Comedor Dylan",
+                version,
+                update_slot,
+                self.theme.clone(),
+                window,
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .p_6()
+                    .child(Label::new("Comedor Dylan").text_xl().font_semibold())
+                    .child(
+                        Label::new(format!("Dylan v{version}"))
+                            .text_sm()
+                            .text_color(theme.muted_foreground),
+                    ),
+            )
     }
 }

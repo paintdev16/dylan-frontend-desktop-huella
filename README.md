@@ -17,7 +17,7 @@ La versión generada por GitHub Actions incluye el repositorio de origen como fu
 3. Sube un tag `vX.Y.Z` que coincida con la versión de `Cargo.toml`. Windows y Linux compilan y empaquetan por separado. Un solo job reúne y firma los archivos, verifica sus hashes y prepara el Release como borrador.
 4. Revisa el instalador de Windows, la AppImage de Linux, los archivos de actualización y la firma. Publica la versión estable con **Set as latest release**.
 
-Para probar una actualización, instala una versión anterior y prepara la siguiente. El borrador queda invisible para la app. Después de publicarlo, abre la versión anterior o pulsa **Buscar actualizaciones**. Al encontrar la nueva versión, elige **Descargar** y luego **Instalar y reiniciar**. En Linux ejecuta la AppImage con permiso de ejecución desde una ubicación donde puedas escribir.
+Para probar una actualización, instala una versión anterior y prepara la siguiente. El borrador queda invisible para la app. Después de publicarlo, abre la versión anterior o pulsa **F5** para buscar. La app también comprueba cada 30 minutos mientras está abierta. Al encontrar la nueva versión, elige **Descargar** y luego **Instalar actualización** en la barra de título. En Linux ejecuta la AppImage con permiso de ejecución desde una ubicación donde puedas escribir.
 
 ## Verificar los archivos descargados
 
