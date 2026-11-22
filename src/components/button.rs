@@ -4,14 +4,14 @@ use std::rc::Rc;
 
 use gpui_kit::{
     component::{
-        Disableable as _, IconName, Sizable as _, Size,
+        Disableable as _, IconName, Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
     },
     prelude::FluentBuilder as _,
     *,
 };
 
-use crate::theme::{ActiveDylanTheme as _, MetricAccent};
+use crate::theme::{ActiveDylanTheme as _, MetricAccent, Radii};
 
 /// Variantes semánticas de botones definidas por la guía visual del comedor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -161,9 +161,15 @@ impl RenderOnce for AppButton {
 
         button = match self.variant {
             AppButtonVariant::Primary => button.primary(),
-            AppButtonVariant::PrimaryGradient => button.primary().when(!self.disabled, |this| {
-                this.bg(dylan.palette.brand.login_button_gradient())
-            }),
+            AppButtonVariant::PrimaryGradient => button
+                .primary()
+                .rounded(Radii::LG)
+                .font_semibold()
+                .when(matches!(self.size, Size::Large), |this| this.h(px(44.0)))
+                .when(!self.disabled, |this| {
+                    this.bg(dylan.palette.brand.login_button_gradient())
+                        .shadow(dylan.palette.brand.brand_shadow())
+                }),
             AppButtonVariant::Secondary => button,
             AppButtonVariant::Tertiary => button.ghost(),
             AppButtonVariant::Destructive => button.danger(),

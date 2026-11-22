@@ -2,7 +2,7 @@ use gpui_kit::{component::v_flex, *};
 
 use crate::{
     components::{background::app_background, title_bar::app_title_bar},
-    features::{updates::UpdateView, welcome::welcome_view},
+    features::{updates::UpdateView, welcome::WelcomeView},
     theme::{ActiveDylanTheme as _, ThemeStore},
 };
 
@@ -13,6 +13,7 @@ pub struct DesktopApp {
     updates: Entity<UpdateView>,
     updates_visible: bool,
     theme: Entity<ThemeStore>,
+    welcome: Entity<WelcomeView>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -22,6 +23,7 @@ impl DesktopApp {
         window.focus(&focus, cx);
         let updates = cx.new(UpdateView::new);
         let theme = cx.new(|cx| ThemeStore::new(window, cx));
+        let welcome = cx.new(|cx| WelcomeView::new(window, cx));
         let observe_updates = cx.observe(&updates, |app, updates, cx| {
             let visible = updates.read(cx).is_visible();
             if app.updates_visible != visible {
@@ -36,6 +38,7 @@ impl DesktopApp {
             updates_visible: updates.read(cx).is_visible(),
             updates,
             theme,
+            welcome,
             _subscriptions: [observe_updates, observe_theme],
         }
     }
@@ -70,6 +73,6 @@ impl Render for DesktopApp {
                 window,
                 cx,
             ))
-            .child(app_background(visuals, welcome_view(&theme, visuals)))
+            .child(app_background(visuals, self.welcome.clone()))
     }
 }
