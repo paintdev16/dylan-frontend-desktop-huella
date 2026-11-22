@@ -1,0 +1,145 @@
+name: Build and prepare desktop release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VPK_VERSION: '1.2.161'
+  RUSTUP_TOOLCHAIN: '1.99.1'
+  APP_BINARY: dylan-frontend-desktop-huella
+  DYLAN_UPDATE_REPO: ${{ github.repository }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            channel: win-x64
+            extension: .exe
+            icon: assets/app.ico
+          - runner: ubuntu-24.04
+            channel: linux-x64
+            extension: ''
+            icon: assets/app.png
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libasound2-dev libfontconfig-dev libfuse2t64 \
+            libglib2.0-dev libssl-dev libvulkan1 libwayland-dev libx11-xcb-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-dev pkg-config
+
+      - name: Check Rust sources
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
+          cargo fmt --check
+          cargo check --locked
+          cargo test --locked
+
+      - name: Read package version
+        id: version
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo metadata.' }
+          $version = ($metadata.packages | Where-Object name -eq $env:APP_BINARY).version
+          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'A stable Cargo version is required to package this release.'
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "The release tag must be v$version."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-dotnet@v4
+        if: steps.version.outputs.version != ''
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build and package with Velopack
+        if: steps.version.outputs.version != ''
+        shell: pwsh
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ matrix.channel }}
+          EXTENSION: ${{ matrix.extension }}
+          APP_ICON: ${{ matrix.icon }}
+        run: |
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo build failed.' }
+          dotnet tool install vpk --version $env:VPK_VERSION --tool-path target/vpk
+          if ($LASTEXITCODE -ne 0) { throw 'Could not install vpk.' }
+
+          $binary = "$env:APP_BINARY$env:EXTENSION"
+          New-Item -ItemType Directory -Force target/pack | Out-Null
+          Copy-Item -LiteralPath "target/release/$binary" -Destination target/pack
+          & "./target/vpk/vpk$env:EXTENSION" pack --packId Dylan.Comedor --packTitle 'Dylan Comedor' `
+            --packVersion $env:VERSION --packDir target/pack --mainExe $binary `
+            --runtime $env:CHANNEL --channel $env:CHANNEL --icon $env:APP_ICON --outputDir target/velopack
+          if ($LASTEXITCODE -ne 0) { throw 'Velopack packaging failed.' }
+
+          $feedName = "releases.$env:CHANNEL.json"
+          $feedDir = 'target/velopack'
+          $feed = Get-Content -LiteralPath "$feedDir/$feedName" -Raw | ConvertFrom-Json
+          $packages = @($feed.Assets | ForEach-Object { $_.FileName })
+          if ($packages.Count -eq 0) { throw 'No update package was generated.' }
+          $installerPattern = if ($IsWindows) { '*Setup.exe' } else { '*.AppImage' }
+          $installer = @(Get-ChildItem -LiteralPath $feedDir -File -Filter $installerPattern)
+          if ($installer.Count -ne 1) { throw 'Expected exactly one installer or AppImage.' }
+
+          New-Item -ItemType Directory -Force target/distribution | Out-Null
+          Copy-Item -LiteralPath $installer[0].FullName -Destination target/distribution
+          foreach ($asset in @($feedName) + $packages) {
+            Copy-Item -LiteralPath "$feedDir/$asset" -Destination target/distribution
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: steps.version.outputs.version != ''
+        with:
+          name: ${{ matrix.channel }}
+          path: target/distribution/
+          if-no-files-found: error
+
+  draft:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: desktop-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/platforms/
+      - name: Sign the Windows and Linux artifacts
+        env:
+          DYLAN_SIGNING_KEY: ${{ secrets.DYLAN_SIGNING_KEY }}
+        run: node scripts/sign-release.mjs target/platforms target/release-assets
+      - name: Prepare the GitHub Release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/draft-release.sh target/release-assets
