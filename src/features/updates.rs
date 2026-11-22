@@ -1,19 +1,18 @@
 use std::{sync::mpsc, time::Duration};
 
 use gpui_kit::{
-    component::{
-        ActiveTheme as _, IconName, Sizable as _,
-        button::{Button, ButtonVariants},
-        h_flex,
-        label::Label,
-        progress::Progress,
-        spinner::Spinner,
-        tag::Tag,
-    },
+    component::{IconName, Sizable as _, h_flex, label::Label, progress::Progress},
     *,
 };
 
-use crate::services::updates::{UpdateAction, UpdateState};
+use crate::{
+    components::{
+        button::AppButton,
+        status_badge::{StatusBadge, StatusTone},
+    },
+    services::updates::{UpdateAction, UpdateState},
+    theme::{ActiveDylanTheme as _, Spacing, Typography},
+};
 
 const UPDATE_REPOSITORY: Option<&str> = option_env!("DYLAN_UPDATE_REPO");
 const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -125,6 +124,8 @@ impl UpdateView {
 
 impl Render for UpdateView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = cx.dylan_theme().palette;
+
         match &self.state {
             UpdateState::Unavailable | UpdateState::Current | UpdateState::Checking => {
                 div().hidden()
@@ -133,16 +134,10 @@ impl Render for UpdateView {
                 let version = update.version();
                 h_flex()
                     .items_center()
-                    .gap_1p5()
+                    .gap(Spacing::XS)
+                    .child(StatusBadge::new(StatusTone::Info, format!("v{version}")))
                     .child(
-                        Tag::primary()
-                            .outline()
-                            .small()
-                            .rounded_full()
-                            .child(format!("v{version}")),
-                    )
-                    .child(
-                        Button::new("download")
+                        AppButton::new("download")
                             .primary()
                             .xsmall()
                             .icon(IconName::ArrowDown)
@@ -159,11 +154,11 @@ impl Render for UpdateView {
                 );
                 h_flex()
                     .items_center()
-                    .gap_2()
+                    .gap(Spacing::SM)
                     .child(
                         Label::new(status)
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground),
+                            .text_size(Typography::XS)
+                            .text_color(palette.muted_foreground),
                     )
                     .child(
                         div().w(px(96.0)).child(
@@ -177,41 +172,47 @@ impl Render for UpdateView {
             }
             UpdateState::Downloaded(update) => {
                 let version = update.version();
-                h_flex().items_center().child(
-                    Button::new("install")
-                        .success()
-                        .xsmall()
-                        .icon(IconName::RefreshCw)
-                        .label("Instalar actualización")
-                        .tooltip(format!("Instalar Dylan v{version} y reiniciar"))
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            if let UpdateState::Downloaded(update) = &view.state {
-                                view.run(UpdateAction::Install(update.clone()), cx);
-                            }
-                        })),
-                )
+                h_flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .child(StatusBadge::new(StatusTone::Success, format!("v{version}")))
+                    .child(
+                        AppButton::new("install")
+                            .primary()
+                            .xsmall()
+                            .icon(IconName::RefreshCw)
+                            .label("Instalar actualización")
+                            .tooltip(format!("Instalar Dylan v{version} y reiniciar"))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let UpdateState::Downloaded(update) = &view.state {
+                                    view.run(UpdateAction::Install(update.clone()), cx);
+                                }
+                            })),
+                    )
             }
             UpdateState::Installing(update) => h_flex().items_center().child(
-                Tag::info().small().rounded_full().child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(Spinner::new().xsmall())
-                        .child(format!("Instalando v{}...", update.version())),
-                ),
+                StatusBadge::new(
+                    StatusTone::Info,
+                    format!("Instalando v{}…", update.version()),
+                )
+                .loading(true),
             ),
             UpdateState::Restarting => h_flex()
                 .items_center()
-                .child(Tag::info().small().rounded_full().child("Reiniciando…")),
-            UpdateState::Failed => h_flex().items_center().child(
-                Button::new("retry-update")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::TriangleAlert)
-                    .label("Reintentar")
-                    .tooltip("No se pudo completar la actualización")
-                    .on_click(cx.listener(|view, _, _, cx| view.check(cx))),
-            ),
+                .child(StatusBadge::new(StatusTone::Info, "Reiniciando…").loading(true)),
+            UpdateState::Failed => h_flex()
+                .items_center()
+                .gap(Spacing::XS)
+                .child(StatusBadge::new(StatusTone::Error, "Actualización fallida"))
+                .child(
+                    AppButton::new("retry-update")
+                        .tertiary()
+                        .xsmall()
+                        .icon(IconName::RefreshCw)
+                        .label("Reintentar")
+                        .tooltip("No se pudo completar la actualización")
+                        .on_click(cx.listener(|view, _, _, cx| view.check(cx))),
+                ),
         }
     }
 }

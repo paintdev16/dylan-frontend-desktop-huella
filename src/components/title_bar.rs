@@ -1,12 +1,15 @@
-use crate::theme::{ThemePreference, ThemeStore};
+use crate::components::brand::brand_tile;
+use crate::theme::{
+    ActiveDylanTheme as _, Radii, Spacing, ThemePreference, ThemeStore, Typography,
+    visuals::{TITLE_BAR_HEIGHT, WINDOW_CONTROL_WIDTH},
+};
 use gpui_kit::{
     component::{
-        ActiveTheme as _, Icon, IconName, Side, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT,
+        ActiveTheme as _, Icon, IconName, Side, Sizable as _, StyledExt as _,
         button::{Button, ButtonVariants as _},
         h_flex,
         label::Label,
         menu::{DropdownMenu as _, PopupMenuItem},
-        tag::Tag,
     },
     prelude::FluentBuilder as _,
     *,
@@ -27,10 +30,11 @@ pub fn app_title_bar(
     window: &Window,
     cx: &App,
 ) -> impl IntoElement {
-    let theme = cx.theme();
-    let title_bar_bg = theme.title_bar;
-    let title_bar_border = theme.title_bar_border;
-    let primary = theme.primary;
+    let theme = cx.dylan_theme();
+    let palette = theme.palette;
+    let visuals = theme.visuals();
+    let title_bar_bg = palette.title_bar;
+    let title_bar_border = cx.theme().title_bar_border;
     let current_theme = theme_store.read(cx).preference();
 
     let show_window_controls = cfg!(target_os = "windows")
@@ -52,9 +56,9 @@ pub fn app_title_bar(
                 .flex_1()
                 .h_full()
                 .items_center()
-                .gap_2()
-                .pl_3()
-                .pr_2()
+                .gap(Spacing::SM)
+                .pl(Spacing::LG)
+                .pr(Spacing::SM)
                 .window_control_area(WindowControlArea::Drag)
                 .when(cfg!(target_os = "linux"), |this| {
                     this.on_mouse_down(MouseButton::Left, |event, window, _| {
@@ -65,17 +69,25 @@ pub fn app_title_bar(
                         }
                     })
                 })
+                .child(brand_tile(visuals, px(22.0)))
                 .child(
-                    Icon::new(IconName::LayoutDashboard)
-                        .small()
-                        .text_color(primary),
+                    Label::new(title)
+                        .text_size(Typography::LG)
+                        .font_semibold()
+                        .text_color(palette.foreground),
                 )
-                .child(Label::new(title).text_sm().font_semibold())
                 .child(
-                    Tag::secondary()
-                        .small()
-                        .rounded_full()
-                        .child(format!("v{version}")),
+                    div()
+                        .px(Spacing::MD)
+                        .py(Spacing::XS)
+                        .rounded(Radii::FULL)
+                        .bg(visuals.version_background)
+                        .child(
+                            Label::new(format!("v{version}"))
+                                .text_size(Typography::BASE)
+                                .font_semibold()
+                                .text_color(visuals.version_foreground),
+                        ),
                 ),
         )
         .child(
@@ -84,8 +96,8 @@ pub fn app_title_bar(
                 .h_full()
                 .flex_shrink_0()
                 .items_center()
-                .gap_2()
-                .pr_2()
+                .gap(Spacing::SM)
+                .pr(Spacing::SM)
                 .when_some(update_slot, |slot, child| slot.child(child))
                 .child(theme_dropdown(current_theme, theme_store)),
         )
@@ -97,7 +109,7 @@ pub fn app_title_bar(
 fn theme_dropdown(current: ThemePreference, theme_store: Entity<ThemeStore>) -> impl IntoElement {
     Button::new("theme-menu")
         .ghost()
-        .xsmall()
+        .small()
         .icon(current.icon())
         .label(current.label())
         .tooltip("Cambiar tema")
@@ -188,7 +200,7 @@ fn window_control_button(
     div()
         .id(id)
         .flex()
-        .w(TITLE_BAR_HEIGHT)
+        .w(WINDOW_CONTROL_WIDTH)
         .h_full()
         .flex_shrink_0()
         .items_center()

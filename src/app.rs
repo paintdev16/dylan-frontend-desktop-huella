@@ -1,10 +1,9 @@
-use gpui_kit::{
-    component::{ActiveTheme as _, StyledExt as _, label::Label, v_flex},
-    *,
-};
+use gpui_kit::{component::v_flex, *};
 
 use crate::{
-    components::title_bar::app_title_bar, features::updates::UpdateView, theme::ThemeStore,
+    components::{background::app_background, title_bar::app_title_bar},
+    features::{updates::UpdateView, welcome::welcome_view},
+    theme::{ActiveDylanTheme as _, ThemeStore},
 };
 
 actions!(desktop, [CheckForUpdates]);
@@ -48,7 +47,8 @@ impl DesktopApp {
 
 impl Render for DesktopApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let theme = *cx.dylan_theme();
+        let visuals = theme.visuals();
         let update_slot = self
             .updates_visible
             .then(|| self.updates.clone().into_any_element());
@@ -60,8 +60,8 @@ impl Render for DesktopApp {
                 app.updates.update(cx, |updates, cx| updates.check(cx));
             }))
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
+            .bg(theme.palette.background)
+            .text_color(theme.palette.foreground)
             .child(app_title_bar(
                 "Comedor Dylan",
                 version,
@@ -70,20 +70,6 @@ impl Render for DesktopApp {
                 window,
                 cx,
             ))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .p_6()
-                    .child(Label::new("Comedor Dylan").text_xl().font_semibold())
-                    .child(
-                        Label::new(format!("Dylan v{version}"))
-                            .text_sm()
-                            .text_color(theme.muted_foreground),
-                    ),
-            )
+            .child(app_background(visuals, welcome_view(&theme, visuals)))
     }
 }
