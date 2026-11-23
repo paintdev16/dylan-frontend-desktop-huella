@@ -20,7 +20,10 @@ fn main() {
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
         theme::install_themes(cx);
-        cx.bind_keys([KeyBinding::new("f5", app::CheckForUpdates, None)]);
+        cx.bind_keys([
+            KeyBinding::new("f5", app::CheckForUpdates, None),
+            KeyBinding::new("ctrl-k", app::FocusGlobalSearch, None),
+        ]);
 
         let mut options = TitleBar::window_options();
         #[cfg(target_os = "linux")]

@@ -30,8 +30,9 @@ pub fn app_workspace_background(theme: &DylanTheme, content: impl IntoElement) -
     v_flex()
         .relative()
         .flex_1()
+        .min_w_0()
         .min_h_0()
-        .w_full()
+        .h_full()
         .overflow_hidden()
         .bg(theme.palette.background)
         .child(cutlery_pattern_backdrop(

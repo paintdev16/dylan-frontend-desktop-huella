@@ -1,3 +1,9 @@
 pub mod auth;
+pub mod cash;
+pub mod consumptions;
 pub mod dashboard;
+pub mod identification;
+pub mod pensioners;
+pub mod reports;
+pub mod settings;
 pub mod updates;

@@ -15,17 +15,25 @@ use gpui_kit::{
     *,
 };
 
-/// Barra de título personalizada de Dylan dividida en 3 zonas independientes:
-/// 1. Zona arrastrable (`WindowControlArea::Drag`): marca, título, versión y espacio libre.
-/// 2. Zona interactiva (sin `Drag` -> `HTCLIENT` en Windows): controles de actualización y menú de tema.
+/// Barra de título personalizada de Dylan dividida en zonas independientes:
+/// 1. Zonas arrastrables (`WindowControlArea::Drag`): marca, título, versión y espaciadores libres.
+/// 2. Zonas interactivas (sin `Drag` -> `HTCLIENT` en Windows): sidebar, buscador,
+///    actualización, tema y cuenta.
 /// 3. Controles nativos de ventana (`Min`, `Max`, `Close`).
 ///
-/// Mantener la zona interactiva fuera de `WindowControlArea::Drag` evita que `WM_NCHITTEST`
-/// (`HTCAPTION`) en Windows capture el primer clic sobre botones de la barra.
+/// Mantener las zonas interactivas fuera de `WindowControlArea::Drag` evita que `WM_NCHITTEST`
+/// (`HTCAPTION`) en Windows capture el primer clic sobre botones o campos de la barra.
+pub struct TitleBarSlots {
+    pub sidebar_toggle: Option<AnyElement>,
+    pub search: Option<AnyElement>,
+    pub update: Option<AnyElement>,
+    pub account: Option<AnyElement>,
+}
+
 pub fn app_title_bar(
     title: impl Into<SharedString>,
     version: &str,
-    update_slot: Option<AnyElement>,
+    slots: TitleBarSlots,
     theme_store: Entity<ThemeStore>,
     window: &Window,
     cx: &App,
@@ -41,8 +49,14 @@ pub fn app_title_bar(
         || (cfg!(target_os = "linux")
             && matches!(window.window_decorations(), Decorations::Client { .. }));
     let viewport_width = window.viewport_size().width;
+    let has_search = slots.search.is_some();
     let compact = viewport_width < px(540.0);
-    let show_version = viewport_width >= px(430.0);
+    let show_version = if has_search {
+        viewport_width >= px(760.0)
+    } else {
+        viewport_width >= px(430.0)
+    };
+    let show_title = !has_search || viewport_width >= px(560.0);
 
     h_flex()
         .id("app-title-bar")
@@ -53,6 +67,16 @@ pub fn app_title_bar(
         .bg(title_bar_bg)
         .border_b_1()
         .border_color(title_bar_border)
+        .when_some(slots.sidebar_toggle, |bar, toggle| {
+            bar.child(
+                h_flex()
+                    .h_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .pl(Spacing::XS)
+                    .child(toggle),
+            )
+        })
         .child(
             h_flex()
                 .id("app-title-bar-drag")
@@ -75,23 +99,25 @@ pub fn app_title_bar(
                     })
                 })
                 .child(brand_tile(visuals, px(22.0)))
-                .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(
-                            Label::new(title)
-                                .text_size(if compact {
-                                    Typography::BASE
-                                } else {
-                                    Typography::LG
-                                })
-                                .font_semibold()
-                                .text_color(palette.foreground),
-                        ),
-                )
+                .when(show_title, |this| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(
+                                Label::new(title)
+                                    .text_size(if compact {
+                                        Typography::BASE
+                                    } else {
+                                        Typography::LG
+                                    })
+                                    .font_semibold()
+                                    .text_color(palette.foreground),
+                            ),
+                    )
+                })
                 .when(show_version, |this| {
                     this.child(
                         div()
@@ -109,6 +135,34 @@ pub fn app_title_bar(
                     )
                 }),
         )
+        .when_some(slots.search, |bar, search| {
+            bar.child(
+                h_flex()
+                    .id("app-title-bar-search")
+                    .h_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .px(Spacing::XS)
+                    .child(search),
+            )
+            .child(
+                div()
+                    .id("app-title-bar-drag-right")
+                    .flex_1()
+                    .min_w(Spacing::SM)
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag)
+                    .when(cfg!(target_os = "linux"), |this| {
+                        this.on_mouse_down(MouseButton::Left, |event, window, _| {
+                            if event.click_count >= 2 {
+                                window.zoom_window();
+                            } else {
+                                window.start_window_move();
+                            }
+                        })
+                    }),
+            )
+        })
         .child(
             h_flex()
                 .id("app-title-bar-actions")
@@ -117,11 +171,64 @@ pub fn app_title_bar(
                 .items_center()
                 .gap(Spacing::SM)
                 .pr(Spacing::SM)
-                .when_some(update_slot, |slot, child| slot.child(child))
-                .child(theme_dropdown(current_theme, theme_store, compact)),
+                .when_some(slots.update, |slot, child| slot.child(child))
+                .child(theme_dropdown(current_theme, theme_store, compact))
+                .when_some(slots.account, |slot, child| slot.child(child)),
         )
         .when(show_window_controls, |this| {
             this.child(window_controls(window, cx))
+        })
+}
+
+pub fn sidebar_toggle(collapsed: bool, on_toggle: impl Fn(&mut App) + 'static) -> impl IntoElement {
+    let (icon, label) = if collapsed {
+        (IconName::PanelLeftOpen, "Expandir menú lateral")
+    } else {
+        (IconName::PanelLeftClose, "Colapsar menú lateral")
+    };
+    Button::new("titlebar-sidebar-toggle")
+        .ghost()
+        .xsmall()
+        .icon(icon)
+        .accessibility_label(label)
+        .tooltip(label)
+        .on_click(move |_, _, cx| on_toggle(cx))
+}
+
+pub fn account_menu(
+    name: SharedString,
+    role: SharedString,
+    window: &Window,
+    on_sign_out: impl Fn(&mut App) + Clone + 'static,
+) -> impl IntoElement {
+    let show_name = window.viewport_size().width >= px(900.0);
+    Button::new("titlebar-account")
+        .ghost()
+        .xsmall()
+        .icon(IconName::User)
+        .when(show_name, |button| {
+            button.child(
+                div()
+                    .max_w(px(148.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(name.clone()),
+            )
+        })
+        .dropdown_caret(show_name)
+        .accessibility_label("Opciones de cuenta")
+        .tooltip("Opciones de cuenta")
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+            let on_sign_out = on_sign_out.clone();
+            menu.item(PopupMenuItem::new(name.clone()).disabled(true))
+                .item(PopupMenuItem::new(role.clone()).disabled(true))
+                .separator()
+                .item(
+                    PopupMenuItem::new("Cerrar sesión")
+                        .icon(IconName::ArrowLeft)
+                        .on_click(move |_, _, cx| on_sign_out(cx)),
+                )
         })
 }
 

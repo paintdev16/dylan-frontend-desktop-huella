@@ -2,7 +2,7 @@
 
 El proyecto parte de una ventana de demostración en `src/main.rs` con Rust y GPUI Kit 0.10.0. El primer entregable funcional será una atención simulada de principio a fin. Un operador inicia sesión, selecciona a un pensionista, confirma un consumo o un abono con tickets físicos y consulta el resultado en Consumos, Caja y Dashboard.
 
-Del proyecto anterior se toma el mapa de módulos. El diseño de las pantallas y su navegación se definen para esta aplicación.
+Del proyecto anterior se toman el mapa de módulos, el sidebar colapsable y la búsqueda global en la barra de título. Los controles se adaptan a los temas claro y oscuro de esta aplicación. [Navegación y búsqueda de referencia](https://github.com/paintdev16/dylan-huella-comedor/blob/main/apps/desktop/src/layout.rs)
 
 ## Arquitectura y patrones
 
@@ -38,15 +38,17 @@ src/
 - [ ] Extraer la composición de la ventana a `src/app.rs`. Crear `features/auth/`, `features/dashboard/` y `state/session.rs` para abrir y cerrar una sesión simulada.
 - [ ] Mostrar en Acceso el formulario de inicio de sesión. El registro de cuentas y la recuperación de contraseña quedan para una etapa posterior, por lo que sus enlaces y pantallas se incorporarán entonces.
 - [ ] Configurar una cuenta de demostración y mostrar un error ante credenciales inválidas. Proteger Dashboard con el estado de sesión y abrir las rutas de otros módulos cuando sus flujos estén disponibles.
+- [ ] Agregar un sidebar colapsable al área autenticada. Agrupar las rutas en Inicio (Dashboard), Operación (Pensionistas, Identificación y Consumos), Administración (Caja y Reportes) y Sistema (Configuración). Mostrar solo los módulos disponibles para el operador y señalar la sección activa en ambos modos del sidebar. Mantener el fondo compartido visible en el área de contenido.
 
-**Aceptación.** La aplicación abre en Acceso. Las credenciales inválidas muestran un error y mantienen al operador en Acceso. La cuenta de demostración abre Dashboard. Cerrar sesión vuelve a Acceso y bloquea el acceso a Dashboard hasta iniciar sesión de nuevo. `cargo check` pasa.
+**Aceptación.** La aplicación abre en Acceso. Las credenciales inválidas muestran un error y mantienen al operador en Acceso. La cuenta de demostración abre Dashboard y permite colapsar y expandir el sidebar sin perder la sección activa. Cerrar sesión vuelve a Acceso, oculta el sidebar y bloquea el acceso a Dashboard hasta iniciar sesión de nuevo. `cargo check` pasa.
 
 ### 2. Pensionistas e identificación simulada
 
 - [ ] Crear `features/pensioners/` con un listado, búsqueda y ficha sobre datos de prueba. Usar el mismo identificador de pensionista en búsqueda, identificación y consumos.
-- [ ] Crear `features/identification/`, `state/reader.rs` y el simulador en `services/biometric/`. Simular coincidencia, huella no reconocida, desconexión y cancelación. Coordinar en `app.rs` la entrega del pensionista identificado al flujo de Consumos.
+- [ ] Crear `features/identification/`, `state/reader.rs` y el simulador en `services/biometric/`. Simular coincidencia, huella no reconocida, desconexión y cancelación. Coordinar en `app.rs` la selección del pensionista identificado.
+- [ ] Agregar **Buscar pensionista** a la barra de título del área autenticada, visible para operadores con permiso de búsqueda. Usar la misma fuente de datos que Pensionistas. Permitir enfocar con `Ctrl+K`, navegar por las coincidencias con el teclado y seleccionar con `Enter`. La Etapa 2 termina con la selección del pensionista.
 
-**Aceptación.** La búsqueda y una coincidencia simulada permiten seleccionar al mismo pensionista. Una cancelación o una huella no reconocida deja la atención sin iniciar y permite reintentar.
+**Aceptación.** El buscador de la barra recibe el foco con `Ctrl+K` y permite elegir un resultado con `Enter`. La búsqueda y una coincidencia simulada seleccionan al mismo pensionista. Una cancelación o una huella no reconocida permite reintentar. La selección por sí sola no registra movimientos.
 
 ### Validaciones tempranas en paralelo con la demostración
 
@@ -57,11 +59,12 @@ src/
 ### 3. Atención automática, Consumos y Caja
 
 - [ ] En `features/consumptions/attendance.rs`, mostrar la persona seleccionada, los consumos y la cantidad de tickets. En `confirm_attendance.rs`, concentrar la validación y el registro sobre una fuente de demostración en memoria.
+- [ ] Abrir **Atención automática** como un modal de Consumos desde el buscador de la barra o desde Identificación, si el operador puede registrar atenciones. El modal muestra el pensionista, los consumos y los tickets antes de confirmar. Mantener una sola atención abierta y devolver el foco a la vista de origen al cerrar el modal. [Modal de referencia](https://github.com/paintdev16/dylan-huella-comedor/blob/main/apps/desktop/src/pages/identification.rs#L851-L858)
 - [ ] En `features/cash/`, implementar apertura, cierre, arqueo e historial. Caja consulta los movimientos de tickets generados por Consumos. La ficha del pensionista muestra su saldo individual.
 - [ ] Deshabilitar la confirmación mientras se procesa. En `confirm_attendance.rs`, tratar los tres casos: consumo sin tickets, abono solo con tickets y consumo con abono. Registrar ambos movimientos como una sola operación cuando corresponda. Impedir que la misma confirmación se registre dos veces.
 - [ ] Probar esas reglas sin abrir GPUI. Si una confirmación contiene tickets y la caja está cerrada, rechazar el intento completo antes de actualizar el consumo, el abono o el saldo.
 
-**Aceptación.** Se puede registrar un consumo, un abono con tickets o ambos. La identificación por sí sola no genera movimientos. Un doble clic registra una sola atención. Con caja cerrada se rechaza el abono con tickets y la operación queda sin cambios. El historial y el saldo reflejan la confirmación.
+**Aceptación.** El operador abre el mismo modal desde el buscador o desde Identificación y puede registrar un consumo, un abono con tickets o ambos. Identificar o cancelar el modal deja el registro sin cambios. Un doble clic en Confirmar registra una sola atención. Con caja cerrada se rechaza el abono con tickets y la operación queda sin cambios. El historial y el saldo reflejan la confirmación.
 
 ### 4. Dashboard, Reportes y Configuración
 
