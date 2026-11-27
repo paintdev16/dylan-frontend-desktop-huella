@@ -7,6 +7,7 @@ use gpui_kit::{
 use crate::{
     components::{
         button::AppButton,
+        loading,
         metric_card::MetricCard,
         status_badge::{StatusBadge, StatusTone},
     },
@@ -17,7 +18,7 @@ use crate::{
     state::{
         reader::{ReaderState, ReaderStatus},
         session::{AppRoute, SessionState},
-        store::{ComedorStore, DatePeriodFilter},
+        store::{CalendarDate, ComedorStore, DataLoad, DatePeriodFilter},
     },
     theme::{ActiveDylanTheme as _, MetricAccent, Radii, Spacing, Typography},
 };
@@ -77,6 +78,32 @@ impl DashboardView {
         }
     }
 
+    fn date_range(&self) -> (CalendarDate, CalendarDate) {
+        let today = CalendarDate::today();
+        match self.period {
+            DatePeriodFilter::Today => (today, today),
+            DatePeriodFilter::Last7Days => (today.sub_days(6), today),
+            DatePeriodFilter::ThisMonth => (CalendarDate { day: 1, ..today }, today),
+            DatePeriodFilter::All => (
+                CalendarDate {
+                    year: 1,
+                    month: 1,
+                    day: 1,
+                },
+                today,
+            ),
+            DatePeriodFilter::Custom { from, to } => (from, to),
+        }
+    }
+
+    pub fn load_metrics(&self, force: bool, cx: &mut Context<Self>) {
+        let range = self.date_range();
+        self.store.update(cx, |store, cx| {
+            store.load_dashboard(range, force, cx);
+        });
+        cx.notify();
+    }
+
     pub fn set_session_sync(
         &mut self,
         syncing: bool,
@@ -95,9 +122,6 @@ impl Render for DashboardView {
         if !session.can_access_dashboard() {
             return div().hidden().into_any_element();
         }
-        let Some(user) = session.current_user().cloned() else {
-            return div().hidden().into_any_element();
-        };
         let can_open_id = session.can_access_route(AppRoute::Identification);
         let can_open_pensioners = session.can_access_route(AppRoute::Pensioners);
         let can_open_consumptions = session.can_access_route(AppRoute::Consumptions);
@@ -113,14 +137,19 @@ impl Render for DashboardView {
         let store = self.store.read(cx);
         let ledger = store.ledger();
         let catalog = ledger.pensioners();
-        let report = ledger.report_for_period(self.period);
         let period_label = self.period.label();
-        let active_pensioners = catalog.iter().filter(|p| p.active).count();
-        let enrolled_pensioners = catalog.iter().filter(|p| p.fingerprint_enrolled).count();
-        let cash_open = ledger.is_cash_open();
-        let active_cash_expected = ledger.expected_cash_cents();
+        let metrics = store.dashboard(self.date_range());
+        let metrics_loading = metrics.is_some_and(|query| query.status() == DataLoad::Loading);
+        let error = metrics.and_then(|query| query.error.clone());
+        let data = metrics.and_then(|query| query.value.as_ref());
+        let consumptions = data.and_then(|data| data.consumptions);
+        let tickets = data.and_then(|data| data.tickets);
+        let pensioners = data.and_then(|data| data.pensioners);
+        let cash = data.and_then(|data| data.cash.as_ref());
 
-        let reader_status = self.reader.read(cx).status().clone();
+        let reader = self.reader.read(cx);
+        let reader_loading = reader.connection_loading();
+        let reader_status = reader.status().clone();
         let reader_tone = match reader_status {
             ReaderStatus::Disconnected { .. } => StatusTone::Error,
             ReaderStatus::Ready | ReaderStatus::Matched { .. } | ReaderStatus::Enrolled { .. } => {
@@ -187,14 +216,6 @@ impl Render for DashboardView {
                                                     .font_bold()
                                                     .text_color(palette.foreground),
                                             )
-                                            .child(
-                                                Label::new(format!(
-                                                    "{} · {} ({})",
-                                                    user.name, user.email, user.role
-                                                ))
-                                                .text_size(Typography::SM)
-                                                .text_color(palette.muted_foreground),
-                                            )
                                             .when_some(
                                                 self.session_notice.clone(),
                                                 |this, (tone, msg)| {
@@ -211,11 +232,9 @@ impl Render for DashboardView {
                                             .flex_wrap()
                                             .items_center()
                                             .gap(Spacing::SM)
-                                            .child(if cash_open {
+                                            .when_some(cash, |row, cash| row.child(if cash.status == "open" {
                                                 StatusBadge::new(StatusTone::Success, "Caja abierta")
-                                            } else {
-                                                StatusBadge::new(StatusTone::Warning, "Caja cerrada")
-                                            })
+                                            } else { StatusBadge::new(StatusTone::Warning, "Caja cerrada") }))
                                             .child(
                                                 AppButton::new("dashboard-refresh-session")
                                                     .tertiary()
@@ -334,7 +353,7 @@ impl Render for DashboardView {
                                                     .label(preset.label())
                                                     .on_click(cx.listener(move |view, _, _, cx| {
                                                         view.period = preset;
-                                                        cx.notify();
+                                                        view.load_metrics(false, cx);
                                                     }));
                                                     if active {
                                                         btn.primary()
@@ -344,97 +363,53 @@ impl Render for DashboardView {
                                                 },
                                             )),
                                     )
-                                    .child(
+                                    .when_some(consumptions, |row, report| row.child(
                                         Label::new(format!(
                                             "{} atenciones · {} raciones en {period_label}",
-                                            report.attendances_count, report.rations
+                                            report.attendances, report.rations
                                         ))
                                         .text_size(Typography::XS)
                                         .text_color(palette.muted_foreground),
-                                    ),
+                                    )),
                             ),
                     )
+                    .when_some(error, |view, error| view.child(
+                        h_flex().gap(Spacing::SM).items_center()
+                            .child(Label::new(error))
+                            .child(AppButton::new("reload-dashboard").secondary().small().label("Reintentar")
+                                .on_click(cx.listener(|view, _, _, cx| view.load_metrics(true, cx)))),
+                    ))
+                    .when(metrics_loading, |view| {
+                        view.child(loading::metrics(
+                            "dashboard-metrics-loading",
+                            "Cargando métricas del panel",
+                            4,
+                            cx,
+                        ))
+                    })
                     .child(
-                        h_flex()
-                            .w_full()
-                            .flex_wrap()
-                            .gap(Spacing::MD)
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Breakfasts,
-                                    "Desayunos",
-                                    report.breakfasts.to_string(),
-                                )
-                                .icon(IconName::Sun)
-                                .subtitle(period_label.clone()),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Lunches,
-                                    "Almuerzos",
-                                    report.lunches.to_string(),
-                                )
-                                .icon(IconName::Calendar)
-                                .subtitle(period_label.clone()),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::CashIn,
-                                    "Efectivo en caja",
-                                    format_soles(active_cash_expected),
-                                )
-                                .icon(IconName::CircleCheck)
-                                .subtitle(if cash_open {
-                                    "Apertura + efectivo ingresado"
-                                } else {
-                                    "Caja cerrada"
-                                }),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::TicketsReceived,
-                                    "Tickets recibidos",
-                                    report.tickets_received.to_string(),
-                                )
-                                .icon(IconName::Info)
-                                .subtitle(format!(
-                                    "{} · {}",
-                                    period_label,
-                                    format_soles(report.ticket_amount_cents)
-                                )),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::CreditBalance,
-                                    "Saldo a favor",
-                                    format_soles(report.credit_balance_cents),
-                                )
-                                .icon(IconName::Check)
-                                .subtitle("Consolidado del padrón"),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::PendingDebt,
-                                    "Deuda pendiente",
-                                    format_soles(report.pending_debt_cents),
-                                )
-                                .icon(IconName::TriangleAlert)
-                                .subtitle("Consolidado del padrón"),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Neutral,
-                                    "Pensionistas activos",
-                                    active_pensioners.to_string(),
-                                )
-                                .icon(IconName::User)
-                                .subtitle(format!(
-                                    "{} registrados · {} con huella · {} raciones",
-                                    catalog.len(),
-                                    enrolled_pensioners,
-                                    report.rations
-                                )),
-                            ),
+                        h_flex().w_full().flex_wrap().gap(Spacing::MD)
+                            .when_some(consumptions, |row, stats| row
+                                .child(MetricCard::new(MetricAccent::Breakfasts, "Desayunos", stats.breakfasts.to_string())
+                                    .icon(IconName::Sun).subtitle(period_label.clone()))
+                                .child(MetricCard::new(MetricAccent::Lunches, "Almuerzos", stats.lunches.to_string())
+                                    .icon(IconName::Calendar).subtitle(period_label.clone())))
+                            .when_some(cash, |row, cash| row.child(
+                                MetricCard::new(MetricAccent::CashIn, "Efectivo en caja",
+                                    cash.expected_cash_cents.map_or_else(|| "Caja cerrada".into(), format_soles))
+                                    .icon(IconName::CircleCheck).subtitle("Apertura + efectivo ingresado"),
+                            ))
+                            .when_some(tickets, |row, stats| row.child(
+                                MetricCard::new(MetricAccent::TicketsReceived, "Tickets recibidos", stats.tickets_count.to_string())
+                                    .icon(IconName::Info).subtitle(format!("{} · {}", period_label, format_soles(stats.ticket_amount_cents))),
+                            ))
+                            .when_some(pensioners, |row, stats| row
+                                .child(MetricCard::new(MetricAccent::CreditBalance, "Saldo a favor", format_soles(stats.credit_balance_cents))
+                                    .icon(IconName::Check).subtitle("Consolidado del padrón"))
+                                .child(MetricCard::new(MetricAccent::PendingDebt, "Deuda pendiente", format_soles(stats.pending_debt_cents))
+                                    .icon(IconName::TriangleAlert).subtitle("Consolidado del padrón"))
+                                .child(MetricCard::new(MetricAccent::Neutral, "Pensionistas activos", stats.active.to_string())
+                                    .icon(IconName::User).subtitle(format!("{} registrados · {} con huella", stats.registered, stats.fingerprint_enrolled)))),
                     )
                     .child(
                         v_flex()
@@ -459,10 +434,16 @@ impl Render for DashboardView {
                                             .font_semibold()
                                             .text_color(palette.foreground),
                                     )
-                                    .child(
+                                    .when(reader_loading, |header| {
+                                        header.child(
+                                            loading::region("dashboard-reader-loading", "Comprobando el lector")
+                                                .child(loading::line("status", px(92.))),
+                                        )
+                                    })
+                                    .when(!reader_loading, |header| header.child(
                                         StatusBadge::new(reader_tone, reader_status.short_label())
                                             .loading(reader_status.is_capturing()),
-                                    ),
+                                    )),
                             )
                             .child(
                                 Label::new(selected_summary.unwrap_or_else(|| {
@@ -471,13 +452,7 @@ impl Render for DashboardView {
                                 .text_size(Typography::SM)
                                 .text_color(palette.muted_foreground),
                             )
-                            .child(
-                                Label::new(
-                                    "Autenticación y permisos conectados al backend Laravel (Sanctum); los módulos de operación continúan sobre datos locales en memoria.",
-                                )
-                                .text_size(Typography::XS)
-                                .text_color(palette.muted_foreground),
-                            ),
+                            ,
                     ),
             )
             .into_any_element()

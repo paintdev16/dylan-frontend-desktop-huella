@@ -280,6 +280,7 @@ fn run_worker(
         config.fdx_dll_path.as_deref(),
         "SECUGEN_FDX_DLL",
         &[
+            "secugen/FDx_SDK_Pro_Windows_v4.3.1_J1.21/FDx SDK Pro for Windows v4.3.1/bin/x64/sgfplib.dll",
             "secugen/FDx SDK Pro for Windows v4.3.1/bin/x64/sgfplib.dll",
             "sgfplib.dll",
         ],
@@ -297,9 +298,7 @@ fn run_worker(
         match command {
             WorkerCommand::Shutdown => break,
             WorkerCommand::Disconnect { reply } => {
-                if let Some(reader) = fdx.as_mut() {
-                    reader.close();
-                }
+                fdx = None;
                 connected_flag.store(false, Ordering::SeqCst);
                 let _ = reply.send(());
             }
@@ -343,6 +342,7 @@ fn run_worker(
                     Ok(label)
                 })();
                 if res.is_err() {
+                    fdx = None;
                     connected_flag.store(false, Ordering::SeqCst);
                 }
                 let _ = reply.send(res);

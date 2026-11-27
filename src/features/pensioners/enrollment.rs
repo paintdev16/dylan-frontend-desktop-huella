@@ -1,4 +1,5 @@
 use gpui_kit::{
+    base::FocusTrapElement as _,
     component::{IconName, StyledExt as _, h_flex, label::Label, v_flex},
     prelude::FluentBuilder as _,
     *,
@@ -10,7 +11,6 @@ use crate::{
         status_badge::{StatusBadge, StatusTone},
     },
     features::pensioners::model::PensionerId,
-    services::biometric::BiometricBackendMode,
     state::{
         reader::{ReaderState, ReaderStatus},
         store::ComedorStore,
@@ -36,11 +36,6 @@ pub struct EnrollmentModal {
 impl EventEmitter<EnrollmentModalEvent> for EnrollmentModal {}
 
 impl EnrollmentModal {
-    pub(super) fn can_use_reader(temporary_profile: bool, reader: &ReaderState) -> bool {
-        // El respaldo SecuGen sobrevive al catálogo temporal y conserva sus códigos.
-        !temporary_profile || reader.backend_mode() == BiometricBackendMode::Simulated
-    }
-
     pub fn new(
         store: Entity<ComedorStore>,
         reader: Entity<ReaderState>,
@@ -128,26 +123,31 @@ impl Render for EnrollmentModal {
         let device_name = reader_ref.device_name();
         let is_capturing = status.is_capturing();
         let is_disconnected = status.is_disconnected();
-        let can_use_reader = Self::can_use_reader(pensioner.temporary_profile, reader_ref);
+        let can_use_reader = !pensioner.temporary_profile;
+        let can_reconnect = reader_ref.can_reconnect();
 
-        let (tone, heading, detail) = match &status {
+        let (tone, badge_label, heading, detail) = match &status {
             _ if !can_use_reader => (
                 StatusTone::Warning,
                 "Perfil temporal",
-                "Usa el simulador para este pensionista. El lector físico requiere un perfil con un código persistente.".to_string(),
+                "Perfil temporal",
+                "El enrolamiento requiere un perfil con un código persistente.".to_string(),
             ),
             ReaderStatus::Disconnected { reason } => (
                 StatusTone::Error,
+                status.short_label(),
                 "Lector no disponible",
                 reason.to_string(),
             ),
             ReaderStatus::Capturing { .. } => (
                 StatusTone::Info,
+                status.short_label(),
                 "Capturando muestras para enrolamiento…",
                 "Coloca el mismo dedo en el lector dos veces seguidas. La ventana permanece responsiva y puedes cancelar en cualquier momento.".to_string(),
             ),
             ReaderStatus::Enrolled { pensioner_id: enrolled } if *enrolled == pensioner_id => (
                 StatusTone::Success,
+                status.short_label(),
                 "Huella enrolada correctamente",
                 format!(
                     "La plantilla quedó registrada bajo el identificador canónico {} sin exponer muestras a la interfaz.",
@@ -156,16 +156,19 @@ impl Render for EnrollmentModal {
             ),
             ReaderStatus::EnrollmentMismatch => (
                 StatusTone::Warning,
+                status.short_label(),
                 "Las dos capturas no coincidieron",
                 "Usa el mismo dedo en ambas lecturas y vuelve a iniciar el enrolamiento.".to_string(),
             ),
             ReaderStatus::Cancelled => (
                 StatusTone::Neutral,
+                status.short_label(),
                 "Enrolamiento cancelado",
                 "El intento fue invalidado de forma segura. Puedes reintentar cuando estés listo.".to_string(),
             ),
             _ => (
                 StatusTone::Success,
+                "Lector listo",
                 if pensioner.fingerprint_enrolled {
                     "Listo para re-enrolar huella"
                 } else {
@@ -256,7 +259,7 @@ impl Render for EnrollmentModal {
                     .p(Spacing::MD)
                     .rounded(Radii::MD)
                     .bg(palette.surface_subtle)
-                    .child(StatusBadge::new(tone, status.short_label()).loading(is_capturing))
+                    .child(StatusBadge::new(tone, badge_label).loading(is_capturing))
                     .child(
                         Label::new(heading)
                             .text_size(Typography::BASE)
@@ -290,7 +293,7 @@ impl Render for EnrollmentModal {
                             .flex_wrap()
                             .items_center()
                             .gap(Spacing::XS)
-                            .when(is_disconnected, |bar| {
+                            .when(is_disconnected && can_reconnect, |bar| {
                                 bar.child(
                                     AppButton::new("enroll-reconnect")
                                         .secondary()
@@ -334,12 +337,7 @@ impl Render for EnrollmentModal {
                                             .read(cx)
                                             .ledger()
                                             .find_pensioner(pensioner_id);
-                                        if pensioner.is_some_and(|p| {
-                                            Self::can_use_reader(
-                                                p.temporary_profile,
-                                                view.reader.read(cx),
-                                            )
-                                        }) {
+                                        if pensioner.is_some_and(|p| !p.temporary_profile) {
                                             view.reader.update(cx, |reader, cx| {
                                                 reader.start_enrollment(pensioner_id, cx);
                                             });
@@ -372,7 +370,8 @@ impl Render for EnrollmentModal {
                     view.close(cx);
                 }),
             )
-            .child(card);
+            .child(card)
+            .focus_trap("enrollment-focus", &self.focus);
 
         deferred(backdrop).with_priority(2).into_any_element()
     }

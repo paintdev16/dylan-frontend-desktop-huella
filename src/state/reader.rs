@@ -8,14 +8,21 @@ use gpui_kit::{Context, EventEmitter, SharedString, Task};
 use crate::{
     features::pensioners::model::PensionerId,
     services::biometric::{
-        BiometricBackendMode, BiometricConfig, BiometricError, BiometricReader, CaptureOutcome,
-        EnrollOutcome, ReaderOperation,
-        simulator::{SimulatedBiometricReader, SimulatedScenario},
+        BiometricConfig, BiometricError, BiometricReader, CaptureOutcome, EnrollOutcome,
+        ReaderOperation,
     },
 };
 
 #[cfg(target_os = "windows")]
-use crate::services::biometric::secugen::SecuGenBiometricReader;
+use std::{mem, time::Duration};
+
+#[cfg(target_os = "windows")]
+use crate::services::biometric::{
+    secugen::SecuGenBiometricReader,
+    usb::{UsbReaderEvent, UsbReaderNotifications},
+};
+
+const READER_DISCONNECTED: &str = "Lector desconectado. Reconecta el equipo o usa búsqueda manual.";
 
 /// Estado observable del lector biométrico expuesto a las vistas.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,60 +261,70 @@ impl ReaderMachine {
     }
 }
 
-/// Entidad reactiva compartida que coordina el servicio biométrico (simulador o SecuGen)
-/// fuera del hilo de GPUI.
+/// Entidad reactiva que coordina el lector SecuGen fuera del hilo de GPUI.
 pub struct ReaderState {
     machine: ReaderMachine,
-    mode: BiometricBackendMode,
-    config: BiometricConfig,
-    simulator: Arc<SimulatedBiometricReader>,
-    reader: Arc<dyn BiometricReader>,
+    config: Option<BiometricConfig>,
+    reader: Option<Arc<dyn BiometricReader>>,
+    connection_task: Option<Task<()>>,
     active_cancel: Option<Arc<AtomicBool>>,
     capture_task: Option<Task<()>>,
+    #[cfg(target_os = "windows")]
+    usb_monitor: Option<Task<()>>,
+    #[cfg(target_os = "windows")]
+    usb_disconnect_pending: bool,
+    #[cfg(target_os = "windows")]
+    usb_reconnect_pending: bool,
 }
 
 impl EventEmitter<ReaderEvent> for ReaderState {}
 
 impl ReaderState {
-    pub fn new_simulated() -> Self {
-        let simulator = Arc::new(SimulatedBiometricReader::new(SimulatedScenario::default()));
-        let reader: Arc<dyn BiometricReader> = simulator.clone();
-        let machine = ReaderMachine::new(reader.is_connected());
+    pub fn new() -> Self {
+        let mut machine = ReaderMachine::new(false);
+        machine.mark_disconnected(if cfg!(target_os = "windows") {
+            "Cargando preferencias del lector SecuGen…"
+        } else {
+            "SecuGen está disponible en Windows x64. Usa la búsqueda manual de pensionistas."
+        });
         Self {
             machine,
-            mode: BiometricBackendMode::Simulated,
-            config: BiometricConfig::default(),
-            simulator,
-            reader,
+            config: None,
+            reader: None,
+            connection_task: None,
             active_cancel: None,
             capture_task: None,
+            #[cfg(target_os = "windows")]
+            usb_monitor: None,
+            #[cfg(target_os = "windows")]
+            usb_disconnect_pending: false,
+            #[cfg(target_os = "windows")]
+            usb_reconnect_pending: false,
         }
     }
 
-    pub fn backend_mode(&self) -> BiometricBackendMode {
-        self.mode
-    }
-
     pub fn device_name(&self) -> String {
-        self.reader.device_name()
+        self.reader
+            .as_ref()
+            .map_or_else(|| "SecuGen".into(), |reader| reader.device_name())
     }
 
     pub fn secusearch_version(&self) -> Option<String> {
-        self.reader.secusearch_version()
+        self.reader
+            .as_ref()
+            .and_then(|reader| reader.secusearch_version())
     }
 
     pub fn status(&self) -> &ReaderStatus {
         self.machine.status()
     }
 
-    pub fn simulate_identification(&mut self, scenario: SimulatedScenario, cx: &mut Context<Self>) {
-        if self.mode == BiometricBackendMode::Simulated
-            && !self.status().is_capturing()
-            && !self.status().is_disconnected()
-        {
-            self.simulator.set_scenario(scenario);
-            self.start_identification(cx);
-        }
+    pub fn can_reconnect(&self) -> bool {
+        cfg!(target_os = "windows") && self.config.is_some() && self.connection_task.is_none()
+    }
+
+    pub fn connection_loading(&self) -> bool {
+        cfg!(target_os = "windows") && (self.config.is_none() || self.connection_task.is_some())
     }
 
     pub fn clear_identification(&mut self, cx: &mut Context<Self>) {
@@ -317,70 +334,37 @@ impl ReaderState {
         }
     }
 
-    /// Cambia el adaptador activo entre el simulador y SecuGen (Windows x64) sin bloquear GPUI.
-    pub fn configure_backend(
-        &mut self,
-        mode: BiometricBackendMode,
-        config: BiometricConfig,
-        cx: &mut Context<Self>,
-    ) {
-        if self.mode == mode && self.config == config {
+    pub fn configure(&mut self, config: BiometricConfig, cx: &mut Context<Self>) {
+        #[cfg(target_os = "windows")]
+        self.monitor_usb(cx);
+        if self.config.as_ref() == Some(&config) {
+            if self.status().is_disconnected() {
+                self.reconnect(cx);
+            }
             return;
         }
         self.cancel_in_flight();
-        self.mode = mode;
-        self.config = config.clone();
-
-        match mode {
-            BiometricBackendMode::Simulated => {
-                self.reader = self.simulator.clone();
-                if self.reader.is_connected() {
-                    self.machine.mark_reconnected();
-                } else {
-                    self.machine.mark_disconnected(
-                        "Simulador desconectado. Reconecta o usa búsqueda manual.",
-                    );
-                }
-                cx.notify();
-            }
-            BiometricBackendMode::SecuGen => {
-                #[cfg(target_os = "windows")]
-                {
-                    match SecuGenBiometricReader::new(config) {
-                        Ok(secugen) => {
-                            let reader: Arc<dyn BiometricReader> = Arc::new(secugen);
-                            self.reader = reader;
-                            self.machine
-                                .mark_disconnected("Inicializando SecuGen (FDx + SecuSearch)…");
-                            cx.notify();
-                            self.reconnect(cx);
-                        }
-                        Err(err) => {
-                            self.reader = self.simulator.clone();
-                            self.machine.mark_disconnected(err.message());
-                            cx.notify();
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    self.machine.mark_disconnected(
-                        "El adaptador SecuGen solo está disponible en Windows x64. Usa el simulador en Linux.",
-                    );
-                    cx.notify();
-                }
-            }
+        self.connection_task = None;
+        self.reader = None;
+        self.config = Some(config);
+        #[cfg(target_os = "windows")]
+        {
+            self.usb_disconnect_pending = false;
+            self.usb_reconnect_pending = false;
         }
+        self.reconnect(cx);
     }
 
     pub fn start_identification(&mut self, cx: &mut Context<Self>) {
+        let Some(reader) = self.reader.clone() else {
+            return;
+        };
         let Ok(attempt_id) = self.machine.begin_identify() else {
             return;
         };
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.active_cancel = Some(cancel.clone());
-        let reader = self.reader.clone();
         cx.notify();
 
         let background = cx
@@ -405,13 +389,15 @@ impl ReaderState {
     }
 
     pub fn start_enrollment(&mut self, pensioner_id: PensionerId, cx: &mut Context<Self>) {
+        let Some(reader) = self.reader.clone() else {
+            return;
+        };
         let Ok(attempt_id) = self.machine.begin_enroll(pensioner_id) else {
             return;
         };
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.active_cancel = Some(cancel.clone());
-        let reader = self.reader.clone();
         cx.notify();
 
         let background = cx
@@ -443,42 +429,163 @@ impl ReaderState {
     }
 
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        let Some(reader) = self
+            .reader
+            .clone()
+            .filter(|_| self.connection_task.is_none())
+        else {
+            return;
+        };
         self.cancel_in_flight();
-        let reader = self.reader.clone();
-        cx.background_executor()
-            .spawn(async move { reader.disconnect() })
-            .detach();
-        self.machine
-            .mark_disconnected("Lector desconectado. Reconecta el equipo o usa búsqueda manual.");
+        let background = cx
+            .background_executor()
+            .spawn(async move { reader.disconnect() });
+        self.connection_task = Some(cx.spawn(async move |this, cx| {
+            background.await;
+            let _ = this.update(cx, |state, cx| {
+                state.connection_task = None;
+                #[cfg(target_os = "windows")]
+                state.apply_pending_usb_events(cx);
+                cx.notify();
+            });
+        }));
+        self.machine.mark_disconnected(READER_DISCONNECTED);
         cx.notify();
     }
 
-    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
-        self.cancel_in_flight();
-        let reader = self.reader.clone();
-        let background = cx
-            .background_executor()
-            .spawn(async move { reader.connect() });
+    #[cfg(target_os = "windows")]
+    fn monitor_usb(&mut self, cx: &mut Context<Self>) {
+        if self.usb_monitor.is_some() {
+            return;
+        }
+        let (sender, receiver) = async_channel::unbounded();
+        let registration = match UsbReaderNotifications::register(sender) {
+            Ok(registration) => registration,
+            Err(code) => {
+                eprintln!(
+                    "No se pudo escuchar la conexión USB de SecuGen (código Windows {code})."
+                );
+                return;
+            }
+        };
+        self.usb_monitor = Some(cx.spawn(async move |this, cx| {
+            let _registration = registration;
+            while let Ok(event) = receiver.recv().await {
+                if this
+                    .update(cx, |state, cx| state.on_usb_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
 
-        self.capture_task = Some(cx.spawn(async move |this, cx| {
+    #[cfg(target_os = "windows")]
+    fn on_usb_event(&mut self, event: UsbReaderEvent, cx: &mut Context<Self>) {
+        match event {
+            UsbReaderEvent::Attached => self.usb_reconnect_pending = true,
+            UsbReaderEvent::Detached => {
+                self.usb_reconnect_pending = false;
+                self.usb_disconnect_pending = true;
+                self.cancel_in_flight();
+                self.machine.mark_disconnected(READER_DISCONNECTED);
+                cx.notify();
+            }
+        }
+        self.apply_pending_usb_events(cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn apply_pending_usb_events(&mut self, cx: &mut Context<Self>) {
+        if self.connection_task.is_some() {
+            return;
+        }
+        if mem::take(&mut self.usb_disconnect_pending) {
+            self.disconnect(cx);
+        }
+        if self.connection_task.is_none()
+            && mem::take(&mut self.usb_reconnect_pending)
+            && self.status().is_disconnected()
+        {
+            self.connect(cx, true);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+        self.connect(cx, false);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn connect(&mut self, cx: &mut Context<Self>, wait_for_usb_driver: bool) {
+        if !self.can_reconnect() {
+            return;
+        }
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        self.cancel_in_flight();
+        if self.reader.is_none() {
+            match SecuGenBiometricReader::new(config) {
+                Ok(reader) => self.reader = Some(Arc::new(reader)),
+                Err(err) => {
+                    self.machine.mark_disconnected(err.message());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let Some(reader) = self.reader.clone() else {
+            return;
+        };
+        self.machine
+            .mark_disconnected("Conectando el lector SecuGen…");
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        let background = cx.background_executor().spawn(async move {
+            if wait_for_usb_driver {
+                executor.timer(Duration::from_millis(350)).await;
+            }
+            let result = reader.connect();
+            if wait_for_usb_driver && matches!(result, Err(BiometricError::Disconnected(_))) {
+                executor.timer(Duration::from_millis(700)).await;
+                return reader.connect();
+            }
+            result
+        });
+
+        self.connection_task = Some(cx.spawn(async move |this, cx| {
             let result = background.await;
             let _ = this.update(cx, |state, cx| {
-                state.capture_task = None;
-                match result {
-                    Ok(()) => state.machine.mark_reconnected(),
-                    Err(err) => state.machine.mark_disconnected(err.message()),
+                state.connection_task = None;
+                if !state.usb_disconnect_pending {
+                    match result {
+                        Ok(()) => state.machine.mark_reconnected(),
+                        Err(err) => state.machine.mark_disconnected(err.message()),
+                    }
                 }
+                state.apply_pending_usb_events(cx);
                 cx.notify();
             });
         }));
     }
 
+    #[cfg(not(target_os = "windows"))]
+    pub fn reconnect(&mut self, _: &mut Context<Self>) {}
+
     pub fn reset_for_sign_out(&mut self, cx: &mut Context<Self>) {
         self.cancel_in_flight();
-        if self.reader.is_connected() {
-            self.machine.mark_reconnected();
-        } else {
-            self.machine.mark_disconnected("Lector no conectado.");
+        if self.connection_task.is_none() && !self.status().is_disconnected() {
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(|reader| reader.is_connected())
+            {
+                self.machine.mark_reconnected();
+            } else {
+                self.machine.mark_disconnected("Lector no conectado.");
+            }
         }
         cx.notify();
     }
@@ -493,11 +600,19 @@ impl ReaderState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReaderMachine, ReaderStatus};
+    use super::{ReaderMachine, ReaderState, ReaderStatus};
     use crate::{
         features::pensioners::model::PensionerId,
         services::biometric::{BiometricError, CaptureOutcome, EnrollOutcome},
     };
+
+    #[test]
+    fn reader_starts_disconnected_until_preferences_are_loaded() {
+        let reader = ReaderState::new();
+        assert!(reader.status().is_disconnected());
+        assert!(!reader.can_reconnect());
+        assert!(reader.reader.is_none());
+    }
 
     #[test]
     fn enforces_exclusive_capture_and_ignores_stale_cancelled_results() {

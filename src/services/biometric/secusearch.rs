@@ -25,6 +25,7 @@ pub const CONF_LEVEL_NORMAL: u32 = 5;
 pub const FPS_ERROR_NONE: i32 = 0;
 pub const FPS_ERROR_DATA_EXIST: i32 = 105;
 pub const FPS_ERROR_IDENTIFICATION_FAIL: i32 = 202;
+const FPS_ERROR_SET_LOCK_PAGE_PRIVILEGE: i32 = 2006;
 pub const FPS_ERROR_DATA_NOT_FOUND: i32 = 2103;
 
 #[repr(C)]
@@ -48,6 +49,11 @@ type FnClearFpDb = unsafe extern "C" fn() -> i32;
 type FnGetFpCount = unsafe extern "C" fn(*mut usize) -> i32;
 
 fn map_sse_error(code: i32, operation: &str) -> BiometricError {
+    if code == FPS_ERROR_SET_LOCK_PAGE_PRIVILEGE {
+        return BiometricError::Device(
+            "SecuSearch requiere el permiso de Windows «Bloquear páginas en memoria» para la cuenta que ejecuta la app (código 2006).".into(),
+        );
+    }
     BiometricError::Device(format!("{operation}: código SecuSearch {code}"))
 }
 

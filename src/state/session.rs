@@ -1,6 +1,9 @@
 use gpui_kit::{Context, SharedString, component::IconName};
 
-use crate::services::api::auth::{ApiUser, AuthenticatedSession, has_full_access, map_permissions};
+use crate::services::api::{
+    auth::{ApiUser, AuthenticatedSession, has_full_access, map_permissions},
+    dining::DiningVersions,
+};
 
 /// Grupos de navegación definidos para el sidebar del área autenticada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +152,7 @@ pub struct SessionUser {
     pub email: SharedString,
     pub role: SharedString,
     pub roles: Vec<String>,
+    pub granted_permissions: Vec<String>,
     pub can_manage_access: bool,
     pub is_super_admin: bool,
     pub email_verified: bool,
@@ -175,8 +179,9 @@ impl SessionUser {
             email: SharedString::from(user.email.clone()),
             role: SharedString::from(user.primary_role_label()),
             roles: user.role_names(),
-            can_manage_access: user.can_manage_access,
-            is_super_admin: user.is_super_admin,
+            granted_permissions: user.permission_names(),
+            can_manage_access: user.can_manage_access(),
+            is_super_admin: user.is_super_admin(),
             email_verified: user.email_verified_at.is_some(),
             remember_me,
             permissions: map_permissions(user),
@@ -191,6 +196,22 @@ impl SessionUser {
                 || user.has_permission("cash.manage"),
         }
     }
+
+    #[allow(dead_code)]
+    pub fn has_role(&self, expected: &str) -> bool {
+        self.roles
+            .iter()
+            .any(|role| role.eq_ignore_ascii_case(expected))
+    }
+
+    #[allow(dead_code)]
+    pub fn has_permission(&self, expected: &str) -> bool {
+        self.is_super_admin
+            || self
+                .granted_permissions
+                .iter()
+                .any(|permission| permission.eq_ignore_ascii_case(expected))
+    }
 }
 
 /// Estado observable de la sesión del operador autenticado contra el backend Laravel Sanctum.
@@ -201,6 +222,8 @@ impl SessionUser {
 pub struct SessionState {
     user: Option<SessionUser>,
     access_token: Option<String>,
+    api_base_url: Option<String>,
+    dining_versions: Option<DiningVersions>,
     expiration_notice: Option<SharedString>,
 }
 
@@ -209,6 +232,8 @@ impl SessionState {
         Self {
             user: None,
             access_token: None,
+            api_base_url: None,
+            dining_versions: None,
             expiration_notice: None,
         }
     }
@@ -219,6 +244,14 @@ impl SessionState {
 
     pub fn access_token(&self) -> Option<&str> {
         self.access_token.as_deref()
+    }
+
+    pub fn api_base_url(&self) -> Option<&str> {
+        self.api_base_url.as_deref()
+    }
+
+    pub fn dining_versions(&self) -> Option<&DiningVersions> {
+        self.dining_versions.as_ref()
     }
 
     pub fn can_access_dashboard(&self) -> bool {
@@ -239,6 +272,41 @@ impl SessionState {
                 .user
                 .as_ref()
                 .is_some_and(|user| user.permissions.search_pensioners)
+    }
+
+    pub fn can_view_pensioner_directory(&self) -> bool {
+        self.is_authenticated()
+            && self.user.as_ref().is_some_and(|user| {
+                user.can_manage_access
+                    || user.has_permission("pensioners.view")
+                    || user.has_permission("pensioners.manage")
+            })
+    }
+
+    pub fn can_view_attendances(&self) -> bool {
+        self.is_authenticated()
+            && self.user.as_ref().is_some_and(|user| {
+                user.can_manage_access
+                    || user.has_permission("consumptions.view")
+                    || user.has_permission("payments.view")
+            })
+    }
+
+    pub fn can_operate_cash(&self) -> bool {
+        self.can_access_route(AppRoute::Cash)
+            && self.user.as_ref().is_some_and(|user| {
+                user.can_manage_access
+                    || user.has_permission("cash.manage")
+                    || user.has_permission("cash.operate")
+            })
+    }
+
+    pub fn can_change_ticket_value(&self) -> bool {
+        self.can_access_route(AppRoute::Cash)
+            && self
+                .user
+                .as_ref()
+                .is_some_and(|user| user.can_manage_access || user.has_permission("cash.manage"))
     }
 
     pub fn pensioner_permissions(&self) -> PensionerPermissions {
@@ -283,6 +351,7 @@ impl SessionState {
     ) -> &SessionUser {
         self.expiration_notice = None;
         self.access_token = Some(authenticated.token);
+        self.dining_versions = authenticated.dining_versions;
         self.user = Some(SessionUser::from_api(&authenticated.user, remember_me));
         self.user.as_ref().expect("session user was just set")
     }
@@ -292,13 +361,15 @@ impl SessionState {
         &mut self,
         authenticated: AuthenticatedSession,
         remember_me: bool,
+        api_base_url: String,
         cx: &mut Context<Self>,
     ) {
         self.apply_authenticated(authenticated, remember_me);
+        self.api_base_url = Some(api_base_url);
         cx.notify();
     }
 
-    /// Actualiza los datos y permisos del usuario autenticado (ej. tras consultar `GET /api/user`).
+    /// Actualiza los datos y permisos del usuario autenticado (ej. tras consultar `GET /api/auth/me`).
     pub fn apply_refreshed_user(&mut self, api_user: &ApiUser) -> bool {
         let Some(existing) = self.user.as_ref() else {
             return false;
@@ -319,6 +390,8 @@ impl SessionState {
     pub fn clear_with_expiration(&mut self, notice: impl Into<SharedString>) -> Option<String> {
         self.expiration_notice = Some(notice.into());
         self.user = None;
+        self.api_base_url = None;
+        self.dining_versions = None;
         self.access_token.take()
     }
 
@@ -336,10 +409,12 @@ impl SessionState {
     pub fn clear(&mut self) -> Option<String> {
         self.expiration_notice = None;
         self.user = None;
+        self.api_base_url = None;
+        self.dining_versions = None;
         self.access_token.take()
     }
 
-    /// Cierra la sesión actual, notifica a las vistas y devuelve el token para `POST /api/logout`.
+    /// Cierra la sesión actual, notifica a las vistas y devuelve el token para `POST /api/auth/logout`.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) -> Option<String> {
         let token = self.clear();
         cx.notify();
@@ -355,6 +430,7 @@ impl SessionState {
                 email: SharedString::from("operador@dylan.pe"),
                 role: SharedString::from("Prueba"),
                 roles: vec!["test".to_string()],
+                granted_permissions: vec![],
                 can_manage_access: false,
                 is_super_admin: false,
                 email_verified: true,
@@ -364,6 +440,8 @@ impl SessionState {
                 view_payments: permissions.cash,
             }),
             access_token: Some("99|test_token".to_string()),
+            api_base_url: None,
+            dining_versions: None,
             expiration_notice: None,
         }
     }
@@ -372,24 +450,22 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::{AppRoute, SessionPermissions, SessionState};
-    use crate::services::api::auth::{ApiRole, ApiUser, AuthenticatedSession};
+    use crate::services::api::auth::{ApiUser, AuthenticatedSession};
 
     fn sample_super_admin_session() -> AuthenticatedSession {
         AuthenticatedSession {
             token: "1|sanctum_super_admin_token".to_string(),
             token_type: "Bearer".to_string(),
+            dining_versions: None,
             user: ApiUser {
                 id: 1,
-                name: "Administrador Principal".to_string(),
+                name: "Paint".to_string(),
                 email: "paint@gmail.com".to_string(),
-                email_verified_at: Some("2026-01-01T00:00:00Z".to_string()),
-                roles: vec![ApiRole {
-                    id: 1,
-                    name: "super-admin".to_string(),
-                }],
-                permissions: vec![],
-                can_manage_access: true,
-                is_super_admin: true,
+                email_verified_at: Some("2026-01-01T00:00:00.000000Z".to_string()),
+                roles: vec!["super-admin".to_string()],
+                permissions: vec!["manage.access".to_string()],
+                created_at: None,
+                updated_at: None,
             },
         }
     }
@@ -405,10 +481,56 @@ mod tests {
     }
 
     #[test]
+    fn cashier_can_search_and_register_attendance_with_only_its_three_routes() {
+        let mut auth = sample_super_admin_session();
+        auth.user.roles = vec!["cajero".into()];
+        auth.user.permissions = [
+            "identification.use",
+            "cash.view",
+            "cash.operate",
+            "attendance.register",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut session = SessionState::new();
+        let user = session.apply_authenticated(auth.clone(), false);
+        assert_eq!(user.role.as_ref(), "Cajero");
+        assert!(!user.can_manage_access);
+        let routes = vec![
+            AppRoute::Dashboard,
+            AppRoute::Identification,
+            AppRoute::Cash,
+        ];
+        assert_eq!(session.available_routes(), routes);
+        assert!(session.can_operate_cash());
+        assert!(!session.can_change_ticket_value());
+        assert!(session.can_search_pensioners());
+        assert!(session.can_register_attendance());
+        assert!(!session.can_view_pensioner_directory());
+        assert_eq!(
+            session.pensioner_permissions(),
+            super::PensionerPermissions::default()
+        );
+
+        auth.user
+            .permissions
+            .retain(|permission| permission != "attendance.register");
+        assert!(session.apply_refreshed_user(&auth.user));
+        assert!(!session.can_search_pensioners());
+        assert!(!session.can_register_attendance());
+        assert_eq!(session.available_routes(), routes);
+
+        auth.user
+            .permissions
+            .retain(|permission| permission != "cash.operate");
+        assert!(session.apply_refreshed_user(&auth.user));
+        assert!(session.can_access_route(AppRoute::Cash));
+        assert!(!session.can_operate_cash());
+    }
+
+    #[test]
     fn read_only_pensioner_access_does_not_grant_profile_or_biometric_changes() {
         let mut auth = sample_super_admin_session();
-        auth.user.is_super_admin = false;
-        auth.user.can_manage_access = false;
         auth.user.roles.clear();
         auth.user.permissions = vec!["pensioners.view".into()];
         let mut session = SessionState::new();
@@ -438,29 +560,34 @@ mod tests {
         assert!(user.remember_me);
         assert!(user.is_super_admin);
         assert!(user.can_manage_access);
+        assert!(user.has_role("super-admin"));
+        assert!(user.has_permission("users.delete"));
         assert!(session.is_authenticated());
         assert_eq!(session.access_token(), Some("1|sanctum_super_admin_token"));
         assert!(session.can_access_dashboard());
         assert_eq!(session.available_routes(), AppRoute::IMPLEMENTED.to_vec());
 
-        // Simula degradación de rol al sincronizar con GET /api/user.
+        // Simula degradación de rol al sincronizar con GET /api/auth/me.
         let downgraded = ApiUser {
             id: 1,
-            name: "Administrador Principal".to_string(),
+            name: "Paint".to_string(),
             email: "paint@gmail.com".to_string(),
-            email_verified_at: Some("2026-01-01T00:00:00Z".to_string()),
-            roles: vec![ApiRole {
-                id: 3,
-                name: "client".to_string(),
-            }],
+            email_verified_at: Some("2026-01-01T00:00:00.000000Z".to_string()),
+            roles: vec!["client".to_string()],
             permissions: vec![],
-            can_manage_access: false,
-            is_super_admin: false,
+            created_at: None,
+            updated_at: None,
         };
         assert!(session.apply_refreshed_user(&downgraded));
         assert_eq!(session.available_routes(), vec![AppRoute::Dashboard]);
         assert!(!session.can_access_route(AppRoute::Cash));
         assert!(!session.can_search_pensioners());
+        assert!(
+            !session
+                .current_user()
+                .expect("user")
+                .has_permission("manage.access")
+        );
 
         let token = session.clear();
         assert_eq!(token.as_deref(), Some("1|sanctum_super_admin_token"));

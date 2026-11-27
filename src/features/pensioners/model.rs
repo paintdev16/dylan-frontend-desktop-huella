@@ -23,14 +23,12 @@ pub struct Pensioner {
     pub dni: String,
     pub full_name: String,
     pub phone: Option<String>,
-    pub plan: String,
     pub active: bool,
     pub fingerprint_enrolled: bool,
     pub temporary_profile: bool,
     /// Saldo en céntimos: positivo = saldo a favor, negativo = deuda pendiente.
     pub balance_cents: i64,
     pub tickets_balance: u32,
-    pub notes: String,
 }
 
 #[derive(Debug, Default)]
@@ -89,11 +87,10 @@ impl Pensioner {
 
     pub(super) fn search_text(&self) -> String {
         normalize_text(&format!(
-            "{} {} {} {} {}",
+            "{} {} {} {}",
             self.full_name,
             self.dni,
             self.code(),
-            self.plan,
             self.phone.as_deref().unwrap_or_default()
         ))
     }
@@ -122,6 +119,7 @@ impl PensionerFilter {
 }
 
 /// Catálogo de pensionistas de demostración para la Etapa 2.
+#[cfg(test)]
 pub fn demo_pensioners() -> Vec<Pensioner> {
     vec![
         Pensioner {
@@ -129,78 +127,66 @@ pub fn demo_pensioners() -> Vec<Pensioner> {
             dni: "72481920".into(),
             full_name: "Ana Lucía Quispe Ramos".into(),
             phone: Some("900000001".into()),
-            plan: "Desayuno y almuerzo".into(),
             active: true,
-            fingerprint_enrolled: true,
+            fingerprint_enrolled: false,
             temporary_profile: false,
             balance_cents: 4500,
             tickets_balance: 8,
-            notes: "Turno habitual de almuerzo 12:30.".into(),
         },
         Pensioner {
             id: PensionerId(1002),
             dni: "45190382".into(),
             full_name: "Carlos Eduardo Paredes Silva".into(),
             phone: None,
-            plan: "Almuerzo diario".into(),
             active: true,
-            fingerprint_enrolled: true,
+            fingerprint_enrolled: false,
             temporary_profile: false,
             balance_cents: -1850,
             tickets_balance: 2,
-            notes: "Regulariza deuda al cierre de semana.".into(),
         },
         Pensioner {
             id: PensionerId(1003),
             dni: "70831245".into(),
             full_name: "María Fernanda Torres Vega".into(),
             phone: None,
-            plan: "Desayuno y almuerzo".into(),
             active: true,
-            fingerprint_enrolled: true,
+            fingerprint_enrolled: false,
             temporary_profile: false,
             balance_cents: 12000,
             tickets_balance: 15,
-            notes: "Sin observaciones.".into(),
         },
         Pensioner {
             id: PensionerId(1004),
             dni: "43829104".into(),
             full_name: "Jorge Luis Mendoza Castillo".into(),
             phone: None,
-            plan: "Solo desayuno".into(),
             active: true,
             fingerprint_enrolled: false,
             temporary_profile: false,
             balance_cents: 0,
             tickets_balance: 4,
-            notes: "Pendiente de enrolamiento biométrico.".into(),
         },
         Pensioner {
             id: PensionerId(1005),
             dni: "74910238".into(),
             full_name: "Rosa Elena Huamán Flores".into(),
             phone: None,
-            plan: "Almuerzo diario".into(),
             active: true,
-            fingerprint_enrolled: true,
+            fingerprint_enrolled: false,
             temporary_profile: false,
             balance_cents: -900,
             tickets_balance: 0,
-            notes: "Prefiere menú bajo en sal.".into(),
         },
         Pensioner {
             id: PensionerId(1006),
             dni: "41029384".into(),
             full_name: "Luis Alberto Rojas Chávez".into(),
             phone: None,
-            plan: "Almuerzo diario".into(),
             active: false,
             fingerprint_enrolled: false,
             temporary_profile: false,
             balance_cents: 0,
             tickets_balance: 0,
-            notes: "Pensión pausada temporalmente.".into(),
         },
     ]
 }
@@ -238,13 +224,13 @@ pub fn format_soles(cents: i64) -> String {
     }
 }
 
-pub(super) fn matches_search_terms(search_text: &str, normalized_query: &str) -> bool {
+pub(in crate::features) fn matches_search_terms(search_text: &str, normalized_query: &str) -> bool {
     normalized_query
         .split_whitespace()
         .all(|term| search_text.contains(term))
 }
 
-pub(super) fn normalize_text(input: &str) -> String {
+pub(in crate::features) fn normalize_text(input: &str) -> String {
     input
         .trim()
         .to_lowercase()
@@ -291,7 +277,9 @@ mod tests {
 
     #[test]
     fn filters_active_inactive_and_enrolled_pensioners_accurately() {
-        let catalog = demo_pensioners();
+        let mut catalog = demo_pensioners();
+        assert!(search_pensioners(&catalog, "", PensionerFilter::Enrolled).is_empty());
+        catalog[0].fingerprint_enrolled = true;
 
         let active = search_pensioners(&catalog, "", PensionerFilter::Active);
         assert!(active.iter().all(|p| p.active));
@@ -303,7 +291,7 @@ mod tests {
 
         let enrolled = search_pensioners(&catalog, "", PensionerFilter::Enrolled);
         assert!(enrolled.iter().all(|p| p.fingerprint_enrolled));
-        assert_eq!(enrolled.len(), 4);
+        assert_eq!(enrolled.len(), 1);
     }
 
     #[test]

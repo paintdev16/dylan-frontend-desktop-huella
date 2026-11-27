@@ -13,8 +13,9 @@ use gpui_kit::{
 
 use crate::{
     components::{
-        brand::brand_tile,
+        brand::dylan_logo,
         button::AppButton,
+        loading,
         status_badge::{StatusBadge, StatusTone},
     },
     services::{
@@ -29,7 +30,7 @@ const MAIL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" h
 
 const LOCK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"#;
 
-/// Pantalla de Acceso conectada a `POST /api/login` del backend Laravel Sanctum.
+/// Pantalla de Acceso conectada a `POST /api/auth/login` del backend Laravel Sanctum.
 ///
 /// Ejecuta las peticiones HTTP fuera del hilo de UI de GPUI, bloquea envíos repetidos
 /// mientras el servidor responde y solo persiste el correo recordado (`Recordarme`) y
@@ -217,7 +218,7 @@ impl AuthView {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.submitting {
+        if self.submitting || !self.preferences.read(cx).is_loaded() {
             return;
         }
 
@@ -258,8 +259,9 @@ impl AuthView {
         self.feedback = None;
         cx.notify();
 
+        let request_url = api_base_url.clone();
         let background = cx.background_executor().spawn(async move {
-            auth::login(&api_base_url, &email_for_request, &password, &device_name)
+            auth::login(&request_url, &email_for_request, &password, &device_name)
         });
 
         cx.spawn_in(window, async move |this, cx| {
@@ -279,7 +281,12 @@ impl AuthView {
                         view.password_input
                             .update(cx, |state, cx| state.clean(window, cx));
                         view.session.update(cx, |session, cx| {
-                            session.sign_in_with_backend(authenticated, remember_me, cx);
+                            session.sign_in_with_backend(
+                                authenticated,
+                                remember_me,
+                                api_base_url,
+                                cx,
+                            );
                         });
                     }
                     Err(err) => {
@@ -307,8 +314,10 @@ impl Render for AuthView {
         let compact = viewport.width < px(520.0) || viewport.height < px(580.0);
         let card_padding = if compact { Spacing::LG } else { Spacing::XXL };
         let outer_padding = if compact { Spacing::MD } else { Spacing::XL };
-        let logo_size = if compact { px(64.0) } else { px(84.0) };
-        let current_api_url = self.preferences.read(cx).preferences().api_base_url.clone();
+        let logo_height = if compact { px(108.0) } else { px(140.0) };
+        let preferences = self.preferences.read(cx);
+        let preferences_loaded = preferences.is_loaded();
+        let current_api_url = preferences.preferences().api_base_url.clone();
 
         v_flex()
             .id("auth-scroll")
@@ -333,7 +342,7 @@ impl Render for AuthView {
                     .border_1()
                     .border_color(visuals.panel_border)
                     .shadow(visuals.panel_shadows().to_vec())
-                    .child(brand_tile(visuals, logo_size))
+                    .child(dylan_logo(logo_height, cx))
                     .child(
                         v_flex()
                             .w_full()
@@ -364,121 +373,138 @@ impl Render for AuthView {
                                     .bg(palette.brand.accent_bar_gradient()),
                             ),
                     )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .mt(if compact { Spacing::LG } else { Spacing::XL })
-                            .gap(Spacing::MD)
-                            .child(
-                                Input::new(&self.email_input)
-                                    .large()
-                                    .h(px(44.0))
-                                    .rounded(Radii::LG)
-                                    .bg(palette.surface)
-                                    .prefix(input_icon_prefix(MAIL_SVG, palette)),
-                            )
-                            .child(
-                                Input::new(&self.password_input)
-                                    .large()
-                                    .h(px(44.0))
-                                    .rounded(Radii::LG)
-                                    .bg(palette.surface)
-                                    .prefix(input_icon_prefix(LOCK_SVG, palette))
-                                    .mask_toggle(),
-                            )
-                            .child(
-                                h_flex().w_full().items_center().pt(Spacing::XS).child(
-                                    Checkbox::new("remember-me")
-                                        .checked(self.remember_me)
-                                        .label("Recordarme")
-                                        .on_change(cx.listener(|view, checked, _, cx| {
-                                            if !view.submitting {
-                                                view.remember_me = *checked;
-                                                cx.notify();
-                                            }
-                                        })),
-                                ),
-                            )
-                            .when_some(self.feedback.clone(), |this, (tone, message)| {
-                                this.child(
-                                    h_flex()
-                                        .w_full()
-                                        .justify_center()
-                                        .child(StatusBadge::new(tone, message)),
-                                )
-                            })
-                            .child(
-                                div().w_full().pt(Spacing::SM).child(
-                                    AppButton::new("login-submit")
-                                        .primary_gradient()
+                    .when(!preferences_loaded, |card| {
+                        card.child(
+                            loading::region("auth-loading", "Cargando configuración de acceso")
+                                .w_full()
+                                .mt(if compact { Spacing::LG } else { Spacing::XL })
+                                .gap(Spacing::MD)
+                                .child(loading::block("email", px(44.)))
+                                .child(loading::block("password", px(44.)))
+                                .child(loading::line("remember-email", px(92.)))
+                                .child(loading::block("submit", px(40.)))
+                                .child(loading::line("server", px(164.))),
+                        )
+                    })
+                    .when(preferences_loaded, |card| {
+                        card.child(
+                            v_flex()
+                                .w_full()
+                                .mt(if compact { Spacing::LG } else { Spacing::XL })
+                                .gap(Spacing::MD)
+                                .child(
+                                    Input::new(&self.email_input)
                                         .large()
-                                        .full_width()
-                                        .disabled(self.submitting)
-                                        .loading(self.submitting)
-                                        .label(if self.submitting {
-                                            "Ingresando…"
-                                        } else {
-                                            "Ingresar"
-                                        })
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            view.submit(window, cx);
-                                        })),
-                                ),
-                            )
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .pt(Spacing::XS)
-                                    .gap(Spacing::XS)
-                                    .child(
+                                        .h(px(44.0))
+                                        .rounded(Radii::LG)
+                                        .bg(palette.surface)
+                                        .prefix(input_icon_prefix(MAIL_SVG, palette)),
+                                )
+                                .child(
+                                    Input::new(&self.password_input)
+                                        .large()
+                                        .h(px(44.0))
+                                        .rounded(Radii::LG)
+                                        .bg(palette.surface)
+                                        .prefix(input_icon_prefix(LOCK_SVG, palette))
+                                        .mask_toggle(),
+                                )
+                                .child(
+                                    h_flex().w_full().items_center().pt(Spacing::XS).child(
+                                        Checkbox::new("remember-me")
+                                            .checked(self.remember_me)
+                                            .label("Recordarme")
+                                            .on_change(cx.listener(|view, checked, _, cx| {
+                                                if !view.submitting {
+                                                    view.remember_me = *checked;
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    ),
+                                )
+                                .when_some(self.feedback.clone(), |this, (tone, message)| {
+                                    this.child(
                                         h_flex()
                                             .w_full()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(Spacing::XS)
-                                            .child(
-                                                Label::new(format!("Servidor: {current_api_url}"))
+                                            .justify_center()
+                                            .child(StatusBadge::new(tone, message)),
+                                    )
+                                })
+                                .child(
+                                    div().w_full().pt(Spacing::SM).child(
+                                        AppButton::new("login-submit")
+                                            .primary_gradient()
+                                            .large()
+                                            .full_width()
+                                            .disabled(self.submitting)
+                                            .loading(self.submitting)
+                                            .label(if self.submitting {
+                                                "Ingresando…"
+                                            } else {
+                                                "Ingresar"
+                                            })
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.submit(window, cx);
+                                            })),
+                                    ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .pt(Spacing::XS)
+                                        .gap(Spacing::XS)
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(Spacing::XS)
+                                                .child(
+                                                    Label::new(format!(
+                                                        "Servidor: {current_api_url}"
+                                                    ))
                                                     .text_size(Typography::XS)
                                                     .text_color(palette.muted_foreground),
-                                            )
-                                            .child(
-                                                AppButton::new("toggle-server-config")
-                                                    .tertiary()
-                                                    .xsmall()
-                                                    .icon(IconName::Settings)
-                                                    .disabled(self.submitting)
-                                                    .label(if self.show_server_config {
-                                                        "Ocultar"
-                                                    } else {
-                                                        "Cambiar"
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        |view, _, window, cx| {
-                                                            view.show_server_config =
-                                                                !view.show_server_config;
-                                                            if view.show_server_config {
-                                                                view.api_url_input.update(
-                                                                    cx,
-                                                                    |state, cx| {
-                                                                        state.focus(window, cx)
-                                                                    },
-                                                                );
-                                                            }
-                                                            cx.notify();
-                                                        },
-                                                    )),
-                                            ),
-                                    )
-                                    .when(self.show_server_config, |this| {
-                                        this.child(
-                                            Input::new(&self.api_url_input)
-                                                .small()
-                                                .rounded(Radii::MD)
-                                                .bg(palette.surface),
+                                                )
+                                                .child(
+                                                    AppButton::new("toggle-server-config")
+                                                        .tertiary()
+                                                        .xsmall()
+                                                        .icon(IconName::Settings)
+                                                        .disabled(self.submitting)
+                                                        .label(if self.show_server_config {
+                                                            "Ocultar"
+                                                        } else {
+                                                            "Cambiar"
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            |view, _, window, cx| {
+                                                                view.show_server_config =
+                                                                    !view.show_server_config;
+                                                                if view.show_server_config {
+                                                                    view.api_url_input.update(
+                                                                        cx,
+                                                                        |state, cx| {
+                                                                            state.focus(window, cx)
+                                                                        },
+                                                                    );
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                ),
                                         )
-                                    }),
-                            ),
-                    ),
+                                        .when(self.show_server_config, |this| {
+                                            this.child(
+                                                Input::new(&self.api_url_input)
+                                                    .small()
+                                                    .rounded(Radii::MD)
+                                                    .bg(palette.surface),
+                                            )
+                                        }),
+                                ),
+                        )
+                    }),
             )
     }
 }

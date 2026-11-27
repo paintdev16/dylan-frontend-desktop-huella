@@ -29,7 +29,7 @@ src/
 
 - **Entidades reactivas de GPUI.** Cada pantalla conserva sus formularios, filtros y tareas en su propia entidad. `state/` contiene la sesión y el estado observable del lector. La vista raíz entrega esas entidades a quienes las usan. Los controles persistentes, como `InputState`, se crean al inicializar la vista.
 - **Flujo unidireccional y observación.** Los componentes reciben valores y devuelven acciones a quien posee el estado. Usar `notify` para comunicar cambios observables y eventos tipados para resultados puntuales, como la identificación de un pensionista. Conservar las suscripciones durante la vida de la vista que las usa.
-- **Adaptador y máquina de estados para el lector.** El lector simulado y SecuGen implementan el mismo contrato en `services/biometric/`. El servicio coordina conexión, identificación, enrolamiento y cancelación. Las vistas reciben estados y resultados. El SDK y el procesamiento de las muestras quedan en el servicio, fuera del hilo de interfaz.
+- **Adaptador y máquina de estados para el lector.** SecuGen implementa el contrato de `services/biometric/`. El servicio coordina conexión, identificación, enrolamiento y cancelación. Las vistas reciben estados y resultados. El SDK y el procesamiento de las muestras quedan en el servicio, fuera del hilo de interfaz.
 
 ## Etapas y criterios de aceptación
 
@@ -42,13 +42,13 @@ src/
 
 **Aceptación.** La aplicación abre en Acceso. Las credenciales inválidas muestran un error y mantienen al operador en Acceso. La cuenta de demostración abre Dashboard y permite colapsar y expandir el sidebar sin perder la sección activa. Cerrar sesión vuelve a Acceso, oculta el sidebar y bloquea el acceso a Dashboard hasta iniciar sesión de nuevo. `cargo check` pasa.
 
-### 2. Pensionistas e identificación simulada
+### 2. Pensionistas e identificación
 
 - [ ] Crear `features/pensioners/` con un listado, búsqueda y ficha sobre datos de prueba. Usar el mismo identificador de pensionista en búsqueda, identificación y consumos.
-- [ ] Crear `features/identification/`, `state/reader.rs` y el simulador en `services/biometric/`. Simular coincidencia, huella no reconocida, desconexión y cancelación. Coordinar en `app.rs` la selección del pensionista identificado.
+- [ ] Crear `features/identification/` y `state/reader.rs` para gestionar coincidencias, huellas no reconocidas, desconexiones y cancelaciones. Coordinar en `app.rs` la selección del pensionista identificado por SecuGen.
 - [ ] Agregar **Buscar pensionista** a la barra de título del área autenticada, visible para operadores con permiso de búsqueda. Usar la misma fuente de datos que Pensionistas. Permitir enfocar con `Ctrl+K`, navegar por las coincidencias con el teclado y seleccionar con `Enter`. La Etapa 2 termina con la selección del pensionista.
 
-**Aceptación.** El buscador de la barra recibe el foco con `Ctrl+K` y permite elegir un resultado con `Enter`. La búsqueda y una coincidencia simulada seleccionan al mismo pensionista. Una cancelación o una huella no reconocida permite reintentar. La selección por sí sola no registra movimientos.
+**Aceptación.** El buscador de la barra recibe el foco con `Ctrl+K` y permite elegir un resultado con `Enter`. La búsqueda y una coincidencia de SecuGen seleccionan al mismo pensionista. Una cancelación o una huella no reconocida permite reintentar. La selección por sí sola no registra movimientos.
 
 ### Validaciones tempranas en paralelo con la demostración
 
@@ -95,7 +95,7 @@ src/
 - [ ] Reunir los resultados de ambos jobs en un solo GitHub Release en borrador por tag. Revisar el borrador y publicar manualmente las versiones estables con **Set as latest release**. [Distribución en GitHub con Velopack](https://docs.velopack.io/distributing/self-hosting#github)
 - [ ] Usar `DYLAN_SIGNING_KEY` como secreto exclusivo del job de firma. Adjuntar un solo `SHA256SUMS.txt` para ambas plataformas y su firma Ed25519 `SHA256SUMS.txt.sig` después de verificar firma y hashes. Velopack usa su propio índice para actualizar. La firma separada permite verificar los archivos descargables y la firma de código de Windows se configura por separado si se incorpora Authenticode. [Firma de código con Velopack](https://docs.velopack.io/packaging/signing)
 
-**Aceptación.** Probar dos versiones consecutivas en Windows x64 y en una distribución Linux x64 objetivo. El borrador contiene el instalador, la AppImage, los archivos de actualización y la firma verificada. Al publicar, cada plataforma ofrece su propio paquete y la app reinicia conservando las preferencias. Si la versión incorpora SecuGen, comprobar el lector en Windows. En Linux se usa el simulador o se muestra el lector como no disponible hasta validar un adaptador nativo.
+**Aceptación.** Probar dos versiones consecutivas en Windows x64 y en una distribución Linux x64 objetivo. El borrador contiene el instalador, la AppImage, los archivos de actualización y la firma verificada. Al publicar, cada plataforma ofrece su propio paquete y la app reinicia conservando las preferencias. Comprobar el lector SecuGen en Windows. En Linux se muestra el lector como no disponible y se puede usar la búsqueda manual.
 
 ## Decisiones pendientes
 

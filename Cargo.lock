@@ -1367,14 +1367,19 @@ dependencies = [
 name = "dylan-frontend-desktop-huella"
 version = "0.1.2"
 dependencies = [
+ "async-channel",
  "chrono",
+ "embed-resource",
  "gpui-kit",
+ "image",
  "libloading",
  "reqwest",
  "ring",
  "serde",
  "serde_json",
+ "uuid",
  "velopack",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

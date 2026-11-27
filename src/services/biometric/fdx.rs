@@ -1,14 +1,18 @@
 #![cfg(target_os = "windows")]
 
 use std::{
+    error::Error as _,
     ffi::c_void,
-    path::Path,
+    path::{Path, absolute},
     ptr,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
-use libloading::Library;
+use libloading::os::windows::{
+    LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    LOAD_LIBRARY_SEARCH_SYSTEM32, Library,
+};
 
 use super::{
     BiometricError,
@@ -103,13 +107,29 @@ pub struct FdxReader {
 
 impl FdxReader {
     pub fn load(dll_path: &Path) -> Result<Self, BiometricError> {
-        verify_dll_matches_architecture(dll_path)?;
+        let dll_path = absolute(dll_path).map_err(|err| {
+            BiometricError::Device(format!(
+                "No se pudo resolver la ruta de FDx SDK Pro ({}): {err}",
+                dll_path.display()
+            ))
+        })?;
+        verify_dll_matches_architecture(&dll_path)?;
 
         // SAFETY: Firmas FFI verificadas contra `FDx SDK Pro for Windows v4.3.1/Inc/sgfplib.h` (x64, WINAPI).
         unsafe {
-            let library = Library::new(dll_path).map_err(|err| {
+            // FDx importa sgwsqlib.dll, distribuida junto a sgfplib.dll en bin/x64.
+            let library = Library::load_with_flags(
+                &dll_path,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+                    | LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+                    | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .map_err(|err| {
+                let cause = err
+                    .source()
+                    .map_or_else(|| err.to_string(), ToString::to_string);
                 BiometricError::Device(format!(
-                    "No se pudo cargar FDx SDK Pro ({}): {err}",
+                    "No se pudo cargar FDx SDK Pro ({}): {cause}",
                     dll_path.display()
                 ))
             })?;

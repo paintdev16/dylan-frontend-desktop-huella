@@ -5,8 +5,8 @@ use gpui_kit::{
 };
 
 use crate::{
-    components::{button::AppButton, metric_card::MetricCard},
-    state::{session::AppRoute, store::DatePeriodFilter},
+    components::{button::AppButton, loading, metric_card::MetricCard},
+    state::store::{CalendarDate, CashMovementKind, DataLoad},
     theme::{ActiveDylanTheme as _, MetricAccent, Radii, Spacing, Typography},
 };
 
@@ -24,37 +24,34 @@ impl PensionersView {
     ) -> impl IntoElement {
         let palette = cx.dylan_theme().palette;
         let id = pensioner.id;
-        let session = self.session.read(cx);
-        let permissions = session.pensioner_permissions();
-        let can_view_consumptions = session.can_access_route(AppRoute::Consumptions);
-        let can_view_tickets = session.can_view_pensioner_payments();
-        let ledger = self.store.read(cx).ledger();
-        let today = ledger.current_date();
-        let consumptions: Vec<_> = ledger
-            .attendances()
-            .iter()
-            .rev()
-            .filter(|record| {
-                can_view_consumptions && record.pensioner_id == id && record.rations() > 0
-            })
-            .collect();
-        let tickets: Vec<_> = ledger
-            .ticket_movements()
-            .iter()
-            .rev()
-            .filter(|record| can_view_tickets && record.pensioner_id == id)
-            .collect();
+        let permissions = self.session.read(cx).pensioner_permissions();
+        let query = self.store.read(cx).pensioner_history(id);
+        let history = query.and_then(|query| query.value.as_ref());
+        let history_loading = query.is_some_and(|query| query.status() == DataLoad::Loading);
+        let history_error = query.and_then(|query| query.error.clone());
+        let pensioner = history.map_or(pensioner, |history| &history.pensioner);
+        let consumptions = history.and_then(|history| history.consumptions.as_deref());
+        let payments = history.and_then(|history| history.payments.as_deref());
+        let can_view_consumptions = consumptions.is_some();
+        let can_view_tickets =
+            payments.is_some() && self.session.read(cx).can_view_pensioner_payments();
+        let today = CalendarDate::today();
+        let month = format!("{:04}-{:02}", today.year, today.month);
         let monthly_consumption = consumptions
+            .unwrap_or_default()
             .iter()
-            .filter(|record| DatePeriodFilter::ThisMonth.contains(record.date, today))
-            .map(|record| record.consumption_cents)
+            .filter(|row| row.date.year == today.year && row.date.month == today.month)
+            .map(|row| row.consumption_cents)
             .sum();
-        let monthly_tickets = tickets
+        let monthly_tickets = payments
+            .unwrap_or_default()
             .iter()
-            .filter(|record| DatePeriodFilter::ThisMonth.contains(record.date, today))
-            .map(|record| record.amount_cents)
+            .filter(|row| {
+                row.kind == CashMovementKind::TicketCredit && row.service_date.starts_with(&month)
+            })
+            .map(|row| row.amount_cents)
             .sum();
-        let monthly_rows = ledger.monthly_summary(id);
+        let monthly_rows = history.map_or_else(Vec::new, |history| history.monthly());
         let mut metadata = vec![pensioner.code()];
         metadata.extend(profile_metadata(pensioner));
         let info = metadata.join(" · ");
@@ -137,13 +134,7 @@ impl PensionersView {
                             .gap(Spacing::XS)
                             .child(account_status(pensioner))
                             .child(fingerprint_status(pensioner)),
-                    )
-                    .when(!pensioner.notes.is_empty(), |header| {
-                        header.child(
-                            Label::new(pensioner.notes.clone())
-                                .text_color(palette.muted_foreground),
-                        )
-                    }),
+                    ),
             )
             .child(
                 v_flex()
@@ -190,11 +181,34 @@ impl PensionersView {
                             ),
                     ),
             )
+            .when_some(history_error, |detail, error| {
+                detail.child(
+                    h_flex()
+                        .items_center()
+                        .gap(Spacing::SM)
+                        .child(Label::new(error))
+                        .child(
+                            AppButton::new("retry-pensioner-history")
+                                .secondary()
+                                .small()
+                                .label("Reintentar")
+                                .on_click(cx.listener(|view, _, _, cx| view.load_data(true, cx))),
+                        ),
+                )
+            })
+            .when(history_loading, |detail| {
+                detail.child(loading::rows(
+                    "pensioner-history-loading",
+                    "Cargando historial del pensionista",
+                    3,
+                    cx,
+                ))
+            })
             .when(can_view_consumptions, |detail| {
                 detail.child(history_panel(
                     "Historial de consumos",
                     "No hay consumos registrados.",
-                    consumptions.iter().map(|record| {
+                    consumptions.unwrap_or_default().iter().map(|record| {
                         (
                             format!(
                                 "{} · {} desayuno(s) · {} almuerzo(s)",
@@ -211,16 +225,19 @@ impl PensionersView {
             .when(can_view_tickets, |detail| {
                 detail.child(history_panel(
                     "Historial de abonos",
-                    "No hay abonos con tickets registrados.",
-                    tickets.iter().map(|record| {
-                        (
+                    "No hay abonos registrados.",
+                    payments.unwrap_or_default().iter().map(|record| {
+                        let payment = if record.kind == CashMovementKind::TicketCredit {
                             format!(
-                                "{} · {} · {} ticket(s) × {}",
-                                record.date.format_iso(),
-                                record.movement_code,
-                                record.tickets_count,
-                                format_soles(record.ticket_unit_cents),
-                            ),
+                                "{} ticket(s) × {}",
+                                record.ticket_count.unwrap_or_default(),
+                                format_soles(record.ticket_unit_cents.unwrap_or_default())
+                            )
+                        } else {
+                            "Pago en efectivo".to_string()
+                        };
+                        (
+                            format!("{} · {} · {payment}", record.service_date, record.code),
                             format_soles(record.amount_cents),
                         )
                     }),
@@ -234,7 +251,9 @@ impl PensionersView {
                         "Desglose mensual",
                         "Sin actividad mensual registrada.",
                         monthly_rows.iter().map(|row| {
-                            let balance_text = if row.net_balance_cents > 0 {
+                            let balance_text = if !(can_view_consumptions && can_view_tickets) {
+                                String::new()
+                            } else if row.net_balance_cents > 0 {
                                 format!("+{} a favor", format_soles(row.net_balance_cents))
                             } else if row.net_balance_cents < 0 {
                                 format!(
@@ -244,17 +263,22 @@ impl PensionersView {
                             } else {
                                 "Al día".to_string()
                             };
-                            (
-                                format!(
-                                    "{} · Consumido {} · Tickets {} ({}) · Efectivo {}",
-                                    row.month_label,
-                                    format_soles(row.consumed_cents),
+                            let mut values = vec![row.month_label.clone()];
+                            if can_view_consumptions {
+                                values.push(format!(
+                                    "Consumido {}",
+                                    format_soles(row.consumed_cents)
+                                ));
+                            }
+                            if can_view_tickets {
+                                values.push(format!(
+                                    "Tickets {} ({}) · Efectivo {}",
                                     row.tickets_count,
                                     format_soles(row.tickets_cents),
-                                    format_soles(row.cash_paid_cents),
-                                ),
-                                balance_text,
-                            )
+                                    format_soles(row.cash_paid_cents)
+                                ));
+                            }
+                            (values.join(" · "), balance_text)
                         }),
                         cx,
                     ))

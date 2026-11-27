@@ -1,7 +1,14 @@
 use std::{sync::mpsc, time::Duration};
 
 use gpui_kit::{
-    component::{IconName, Sizable as _, h_flex, label::Label, progress::Progress},
+    component::{
+        IconName, Sizable as _,
+        button::{Button, ButtonVariants as _},
+        h_flex,
+        label::Label,
+        notification::Notification,
+        progress::Progress,
+    },
     *,
 };
 
@@ -17,19 +24,79 @@ use crate::{
 const UPDATE_REPOSITORY: Option<&str> = option_env!("DYLAN_UPDATE_REPO");
 const CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// Identificador único para reemplazar o cerrar notificaciones de actualización sin duplicarlas.
+pub struct UpdateNotificationId;
+
+/// Eventos emitidos por `UpdateView` para mostrar notificaciones `Notification` en la ventana.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateEvent {
+    Available(SharedString),
+    DownloadStarted,
+    Downloaded(SharedString),
+    InstallStarted,
+}
+
+pub fn build_available_notification(
+    version: SharedString,
+    updates: Entity<UpdateView>,
+) -> Notification {
+    Notification::info(format!(
+        "Comedor Dylan v{version} está disponible para descargar."
+    ))
+    .id::<UpdateNotificationId>()
+    .title("Nueva versión disponible")
+    .action(move |_, _, cx| {
+        let updates = updates.clone();
+        Button::new("notification-update-download")
+            .primary()
+            .icon(IconName::ArrowDown)
+            .label("Descargar")
+            .on_click(cx.listener(move |toast, _, window, cx| {
+                toast.dismiss(window, cx);
+                updates.update(cx, |view, cx| view.start_download(cx));
+            }))
+    })
+}
+
+pub fn build_downloaded_notification(
+    version: SharedString,
+    updates: Entity<UpdateView>,
+) -> Notification {
+    Notification::success(format!(
+        "Comedor Dylan v{version} terminó de descargarse y está lista para instalarse."
+    ))
+    .id::<UpdateNotificationId>()
+    .title("Actualización descargada")
+    .action(move |_, _, cx| {
+        let updates = updates.clone();
+        Button::new("notification-update-install")
+            .primary()
+            .icon(IconName::RefreshCw)
+            .label("Instalar")
+            .on_click(cx.listener(move |toast, _, window, cx| {
+                toast.dismiss(window, cx);
+                updates.update(cx, |view, cx| view.start_install(cx));
+            }))
+    })
+}
+
 pub struct UpdateView {
     state: UpdateState,
     progress: Option<i16>,
+    notified_available_version: Option<String>,
     work: Option<Task<()>>,
     progress_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
 }
+
+impl EventEmitter<UpdateEvent> for UpdateView {}
 
 impl UpdateView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             state: UpdateState::Unavailable,
             progress: None,
+            notified_available_version: None,
             work: None,
             progress_task: None,
             poll_task: None,
@@ -41,7 +108,7 @@ impl UpdateView {
                     cx.background_executor().timer(CHECK_INTERVAL).await;
                     if this
                         .update(cx, |view, cx| {
-                            view.check(cx);
+                            view.poll_check(cx);
                         })
                         .is_err()
                     {
@@ -67,7 +134,17 @@ impl UpdateView {
         )
     }
 
+    /// Búsqueda manual (ej. `F5` o botón Reintentar): vuelve a notificar si encuentra versión.
     pub fn check(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, UpdateState::Current | UpdateState::Failed)
+            && let Some(repository) = UPDATE_REPOSITORY
+        {
+            self.notified_available_version = None;
+            self.run(UpdateAction::Check(repository), cx);
+        }
+    }
+
+    fn poll_check(&mut self, cx: &mut Context<Self>) {
         if matches!(self.state, UpdateState::Current | UpdateState::Failed)
             && let Some(repository) = UPDATE_REPOSITORY
         {
@@ -75,12 +152,13 @@ impl UpdateView {
         }
     }
 
-    fn download(&mut self, cx: &mut Context<Self>) {
+    pub fn start_download(&mut self, cx: &mut Context<Self>) {
         let UpdateState::Available(update) = &self.state else {
             return;
         };
         let (sender, receiver) = mpsc::channel();
         self.progress = None;
+        cx.emit(UpdateEvent::DownloadStarted);
         self.run(UpdateAction::Download(update.clone(), sender), cx);
         self.progress_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -100,6 +178,14 @@ impl UpdateView {
         }));
     }
 
+    pub fn start_install(&mut self, cx: &mut Context<Self>) {
+        if let UpdateState::Downloaded(update) = &self.state {
+            let update = update.clone();
+            cx.emit(UpdateEvent::InstallStarted);
+            self.run(UpdateAction::Install(update), cx);
+        }
+    }
+
     fn run(&mut self, action: UpdateAction, cx: &mut Context<Self>) {
         self.state = action.pending_state();
         cx.notify();
@@ -112,8 +198,22 @@ impl UpdateView {
             });
             let _ = this.update(cx, |view, cx| {
                 view.progress_task = None;
-                if matches!(state, UpdateState::Restarting) {
-                    cx.quit();
+                match &state {
+                    UpdateState::Available(update) => {
+                        let version = update.version().to_string();
+                        if view.notified_available_version.as_deref() != Some(version.as_str()) {
+                            view.notified_available_version = Some(version.clone());
+                            cx.emit(UpdateEvent::Available(SharedString::from(version)));
+                        }
+                    }
+                    UpdateState::Downloaded(update) => {
+                        let version = SharedString::from(update.version().to_string());
+                        cx.emit(UpdateEvent::Downloaded(version));
+                    }
+                    UpdateState::Restarting => {
+                        cx.quit();
+                    }
+                    _ => {}
                 }
                 view.state = state;
                 cx.notify();
@@ -143,7 +243,7 @@ impl Render for UpdateView {
                             .icon(IconName::ArrowDown)
                             .label("Descargar")
                             .tooltip(format!("Nueva versión disponible: Dylan v{version}"))
-                            .on_click(cx.listener(|view, _, _, cx| view.download(cx))),
+                            .on_click(cx.listener(|view, _, _, cx| view.start_download(cx))),
                     )
             }
             UpdateState::Downloading(update) => {
@@ -183,11 +283,7 @@ impl Render for UpdateView {
                             .icon(IconName::RefreshCw)
                             .label("Instalar actualización")
                             .tooltip(format!("Instalar Dylan v{version} y reiniciar"))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if let UpdateState::Downloaded(update) = &view.state {
-                                    view.run(UpdateAction::Install(update.clone()), cx);
-                                }
-                            })),
+                            .on_click(cx.listener(|view, _, _, cx| view.start_install(cx))),
                     )
             }
             UpdateState::Installing(update) => h_flex().items_center().child(

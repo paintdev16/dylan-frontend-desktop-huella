@@ -13,12 +13,7 @@ pub struct AppVisuals {
     pub panel_border: Hsla,
     pub panel_shadow: Hsla,
     pub glow: Hsla,
-    pub brand_background: Background,
-    pub brand_border: Hsla,
-    pub brand_foreground: Hsla,
     pub watermark: Hsla,
-    pub version_background: Hsla,
-    pub version_foreground: Hsla,
 }
 
 impl AppVisuals {
@@ -48,12 +43,7 @@ impl DylanTheme {
                 panel_border: hex(0xA78BFA).alpha(0.45),
                 panel_shadow: hex(0x070A1D),
                 glow: hex(0x8B5CF6),
-                brand_background: gradient(145.0, hex(0x9837FF), hex(0x3038C9)),
-                brand_border: hex(0xD0ACFF).alpha(0.62),
-                brand_foreground: hex(0xFFFFFF),
                 watermark: hex(0xA78BFA),
-                version_background: hex(0x413EB8),
-                version_foreground: hex(0xFFFFFF),
             }
         } else {
             AppVisuals {
@@ -67,12 +57,7 @@ impl DylanTheme {
                 panel_border: hex(0xFFFFFF).alpha(0.88),
                 panel_shadow: hex(0x4246DE),
                 glow: hex(0x8B5CF6),
-                brand_background: gradient(146.0, hex(0x9837FF), hex(0x373BD4)),
-                brand_border: hex(0xE3C4FF).alpha(0.78),
-                brand_foreground: hex(0xFFFFFF),
                 watermark: hex(0x6438E8),
-                version_background: hex(0xE3DAFC),
-                version_foreground: hex(0x552BD4),
             }
         }
     }

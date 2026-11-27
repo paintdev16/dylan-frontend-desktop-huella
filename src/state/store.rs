@@ -1,28 +1,43 @@
 use std::{
-    collections::{BTreeMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
+    hash::Hash,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use gpui_kit::Context;
+#[cfg(test)]
+use std::collections::{BTreeMap, HashSet};
+
+use gpui_kit::{Context, Entity, EventEmitter, Task};
+
+#[cfg(test)]
+use crate::features::{
+    consumptions::confirm_attendance::{AttendanceRequest, AttendanceSummary},
+    pensioners::model::{PensionerDraft, demo_pensioners, format_soles},
+};
+
+use crate::services::api::{
+    ApiError,
+    dining::{
+        CashSnapshot, DailyActivity, DashboardData, DiningApi, DiningVersions, PensionerHistory,
+    },
+};
+
+use super::{
+    query_cache::{CachedQuery, QueryCache},
+    session::{AppRoute, SessionState, SessionUser},
+};
 
 use crate::features::{
-    consumptions::{
-        confirm_attendance::{
-            AttendanceError, AttendanceRequest, AttendanceSummary,
-            confirm_attendance as execute_confirm_attendance,
-        },
-        order::ConsumptionItem,
-    },
+    consumptions::order::ConsumptionItem,
     pensioners::{
         SelectionSource,
-        model::{
-            Pensioner, PensionerDraft, PensionerId, demo_pensioners, find_by_id, format_soles,
-        },
+        model::{Pensioner, PensionerId, find_by_id},
     },
 };
 
 /// Tarifas de demostración en céntimos de sol (alineadas a `dylan-huella-comedor`).
+#[cfg(test)]
 pub const BREAKFAST_PRICE_CENTS: i64 = 700;
+#[cfg(test)]
 pub const LUNCH_PRICE_CENTS: i64 = 700;
 /// Valor inicial configurable del ticket físico: S/ 7.00 (700 céntimos).
 pub const DEFAULT_TICKET_VALUE_CENTS: i64 = 700;
@@ -36,6 +51,7 @@ pub struct CalendarDate {
 }
 
 impl CalendarDate {
+    #[allow(dead_code)]
     pub fn new(year: i32, month: u8, day: u8) -> Option<Self> {
         if !(1..=12).contains(&month) {
             return None;
@@ -58,6 +74,7 @@ impl CalendarDate {
         Self::from_unix_days(days)
     }
 
+    #[allow(dead_code)]
     pub fn parse_iso(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         let mut parts = trimmed.split('-');
@@ -110,6 +127,7 @@ impl CalendarDate {
     }
 }
 
+#[allow(dead_code)]
 fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -149,6 +167,7 @@ impl DatePeriodFilter {
         }
     }
 
+    #[cfg(test)]
     pub fn contains(self, date: CalendarDate, today: CalendarDate) -> bool {
         match self {
             Self::Today => date == today,
@@ -161,6 +180,7 @@ impl DatePeriodFilter {
 }
 
 /// Resumen por pensionista dentro de un periodo consultado.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PensionerPeriodSummary {
     pub pensioner_id: PensionerId,
@@ -189,6 +209,7 @@ pub struct MonthlyPensionerSummary {
 }
 
 /// Totales acumulados de cuenta corriente para un pensionista.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PensionerAccountTotals {
     pub consumed_cents: i64,
@@ -197,6 +218,7 @@ pub struct PensionerAccountTotals {
     pub tickets_cents: i64,
 }
 
+#[allow(dead_code)]
 impl PensionerAccountTotals {
     pub fn total_paid_cents(self) -> i64 {
         self.cash_paid_cents.saturating_add(self.tickets_cents)
@@ -204,6 +226,7 @@ impl PensionerAccountTotals {
 }
 
 /// Consolidado compartido por Dashboard y Reportes para un mismo periodo.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeriodReport {
     pub attendances_count: usize,
@@ -233,6 +256,10 @@ pub struct AttendanceRecord {
     pub breakfasts: u32,
     pub lunches: u32,
     pub items: Vec<ConsumptionItem>,
+    pub item_prices: Vec<i64>,
+    pub has_consumptions: bool,
+    pub has_payments: bool,
+    pub has_balance: bool,
     pub picked_up_by: Option<String>,
     pub consumption_cents: i64,
     /// Cantidad de tickets físicos recibidos (almacenada por separado del importe).
@@ -267,7 +294,8 @@ impl AttendanceRecord {
 }
 
 /// Tipos de movimiento auditable en Caja (alineados a `dylan-huella-comedor`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CashMovementKind {
     Opening,
     Closing,
@@ -309,6 +337,7 @@ pub struct CashMovement {
 }
 
 /// Movimiento de tickets físicos registrado en Caja por una atención confirmada.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CashTicketMovement {
     pub id: u64,
@@ -327,7 +356,7 @@ pub struct CashTicketMovement {
 }
 
 /// Resultado de un arqueo de caja comparando lo esperado contra lo contado físicamente.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct CashAuditRecord {
     pub expected_tickets: u32,
     pub counted_tickets: u32,
@@ -355,16 +384,19 @@ pub struct CashSession {
     pub opening_cash_cents: i64,
     pub cash_inflow_cents: i64,
     pub last_audit: Option<CashAuditRecord>,
+    pub expected_tickets: u32,
+    pub expected_ticket_amount_cents: i64,
+    #[cfg(test)]
     pub movements: Vec<CashTicketMovement>,
 }
 
 impl CashSession {
     pub fn total_tickets(&self) -> u32 {
-        self.movements.iter().map(|m| m.tickets_count).sum()
+        self.expected_tickets
     }
 
     pub fn total_ticket_amount_cents(&self) -> i64 {
-        self.movements.iter().map(|m| m.amount_cents).sum()
+        self.expected_ticket_amount_cents
     }
 
     pub fn expected_cash_cents(&self) -> i64 {
@@ -372,6 +404,7 @@ impl CashSession {
             .saturating_add(self.cash_inflow_cents)
     }
 
+    #[cfg(test)]
     pub fn movement_count(&self) -> usize {
         self.movements.len()
     }
@@ -392,9 +425,9 @@ pub struct ClosedCashSession {
     pub expected_ticket_amount_cents: i64,
     pub audit: CashAuditRecord,
     pub movement_count: usize,
-    pub notes: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CashError {
     AlreadyOpen,
@@ -407,68 +440,69 @@ pub enum CashError {
     DuplicateOperation,
 }
 
-impl CashError {
-    pub const fn message(self) -> &'static str {
-        match self {
-            Self::AlreadyOpen => "Ya existe una caja abierta en este turno.",
-            Self::NotOpen => "La caja está cerrada. Ábrela antes de realizar esta operación.",
-            Self::InvalidOpeningAmount => {
-                "El monto de apertura debe ser un número válido mayor o igual a S/ 0.00."
-            }
-            Self::InvalidCountedCash => {
-                "El efectivo contado debe ser un número válido mayor o igual a S/ 0.00."
-            }
-            Self::InvalidTicketValue => {
-                "El valor del ticket físico debe ser un monto mayor a S/ 0.00."
-            }
-            Self::InvalidPaymentAmount => "El importe del pago debe ser mayor a S/ 0.00.",
-            Self::PensionerNotFound => "No se encontró el pensionista indicado.",
-            Self::DuplicateOperation => "Esta operación de caja ya fue registrada.",
-        }
-    }
-}
-
-/// Fuente única en memoria compartida por Pensionistas, Consumos, Caja, Dashboard y Reportes.
-/// Probable de forma determinista sin abrir GPUI.
+/// Datos de Laravel en memoria para las vistas del escritorio.
 #[derive(Debug, Clone)]
-pub struct DemoLedger {
+pub struct DiningLedger {
     pensioners: Vec<Pensioner>,
     attendances: Vec<AttendanceRecord>,
     active_cash: Option<CashSession>,
     closed_cash_sessions: Vec<ClosedCashSession>,
+    #[cfg(test)]
     ticket_movements: Vec<CashTicketMovement>,
     cash_movements: Vec<CashMovement>,
     ticket_value_cents: i64,
+    #[cfg(test)]
     processed_keys: HashSet<String>,
+    #[cfg(test)]
     next_attendance_id: u64,
+    #[cfg(test)]
     next_movement_id: u64,
+    #[cfg(test)]
     next_cash_movement_seq: u32,
+    #[cfg(test)]
     next_cash_session_id: u64,
+    #[cfg(test)]
     next_event_seq: u32,
     clock_override: Option<CalendarDate>,
 }
 
-impl Default for DemoLedger {
+#[cfg(test)]
+impl Default for DiningLedger {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DemoLedger {
+impl DiningLedger {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             pensioners: demo_pensioners(),
+            ..Self::empty()
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            pensioners: Vec::new(),
             attendances: Vec::new(),
             active_cash: None,
             closed_cash_sessions: Vec::new(),
+            #[cfg(test)]
             ticket_movements: Vec::new(),
             cash_movements: Vec::new(),
             ticket_value_cents: DEFAULT_TICKET_VALUE_CENTS,
+            #[cfg(test)]
             processed_keys: HashSet::new(),
+            #[cfg(test)]
             next_attendance_id: 1,
+            #[cfg(test)]
             next_movement_id: 1,
+            #[cfg(test)]
             next_cash_movement_seq: 1,
+            #[cfg(test)]
             next_cash_session_id: 1,
+            #[cfg(test)]
             next_event_seq: 1,
             clock_override: None,
         }
@@ -487,6 +521,7 @@ impl DemoLedger {
         self.ticket_value_cents
     }
 
+    #[cfg(test)]
     pub fn set_ticket_value_cents(&mut self, cents: i64) -> Result<(), CashError> {
         if cents <= 0 {
             return Err(CashError::InvalidTicketValue);
@@ -503,6 +538,7 @@ impl DemoLedger {
         find_by_id(&self.pensioners, id)
     }
 
+    #[cfg(test)]
     fn save_pensioner(
         &mut self,
         id: Option<PensionerId>,
@@ -543,8 +579,6 @@ impl DemoLedger {
             full_name: draft.full_name,
             dni: draft.dni,
             phone,
-            plan: String::new(),
-            notes: String::new(),
             active: true,
             fingerprint_enrolled: false,
             temporary_profile: true,
@@ -568,6 +602,7 @@ impl DemoLedger {
         &self.attendances
     }
 
+    #[cfg(test)]
     pub fn is_cash_open(&self) -> bool {
         self.active_cash.is_some()
     }
@@ -580,6 +615,7 @@ impl DemoLedger {
         &self.closed_cash_sessions
     }
 
+    #[cfg(test)]
     pub fn ticket_movements(&self) -> &[CashTicketMovement] {
         &self.ticket_movements
     }
@@ -600,6 +636,7 @@ impl DemoLedger {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub fn expected_cash_cents(&self) -> i64 {
         self.active_cash
             .as_ref()
@@ -615,31 +652,40 @@ impl DemoLedger {
             .sum()
     }
 
+    #[cfg(test)]
     pub fn total_breakfasts(&self) -> u32 {
         self.attendances.iter().map(|a| a.breakfasts).sum()
     }
 
+    #[cfg(test)]
     pub fn total_lunches(&self) -> u32 {
         self.attendances.iter().map(|a| a.lunches).sum()
     }
 
+    #[cfg(test)]
     pub fn total_tickets_received(&self) -> u32 {
         self.ticket_movements.iter().map(|m| m.tickets_count).sum()
     }
 
+    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn total_ticket_amount_cents(&self) -> i64 {
         self.ticket_movements.iter().map(|m| m.amount_cents).sum()
     }
 
+    #[cfg(test)]
     pub fn total_credit_balance_cents(&self) -> i64 {
         self.pensioners.iter().map(Pensioner::credit_cents).sum()
     }
 
+    #[cfg(test)]
     pub fn total_pending_debt_cents(&self) -> i64 {
         self.pensioners.iter().map(Pensioner::debt_cents).sum()
     }
 
     /// Totales históricos de cuenta corriente para un pensionista (consumos, efectivo y tickets).
+    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn pensioner_totals(&self, id: PensionerId) -> PensionerAccountTotals {
         let consumed_cents = self
             .attendances
@@ -670,6 +716,7 @@ impl DemoLedger {
 
     /// Desglose mensual por pensionista (consumido, efectivo, tickets y balance neto del mes),
     /// ordenado del mes más reciente al más antiguo.
+    #[cfg(test)]
     pub fn monthly_summary(&self, id: PensionerId) -> Vec<MonthlyPensionerSummary> {
         let mut by_month: BTreeMap<(i32, u8), MonthlyPensionerSummary> = BTreeMap::new();
 
@@ -742,6 +789,7 @@ impl DemoLedger {
     }
 
     /// Calcula el consolidado del periodo indicado sobre los mismos registros de Consumos y Caja.
+    #[cfg(test)]
     pub fn report_for_period(&self, filter: DatePeriodFilter) -> PeriodReport {
         let today = self.current_date();
         let attendances: Vec<AttendanceRecord> = self
@@ -849,6 +897,7 @@ impl DemoLedger {
         }
     }
 
+    #[cfg(test)]
     pub fn open_cash(
         &mut self,
         operator: impl Into<String>,
@@ -894,6 +943,8 @@ impl DemoLedger {
             opening_cash_cents,
             cash_inflow_cents: 0,
             last_audit: None,
+            expected_tickets: 0,
+            expected_ticket_amount_cents: 0,
             movements: Vec::new(),
         });
 
@@ -902,6 +953,7 @@ impl DemoLedger {
 
     /// Registra un pago en efectivo separado de los tickets físicos (suma a `cash_inflow_cents`).
     #[allow(dead_code)]
+    #[cfg(test)]
     pub fn record_cash_payment(
         &mut self,
         idempotency_key: impl Into<String>,
@@ -967,6 +1019,7 @@ impl DemoLedger {
         Ok(movement)
     }
 
+    #[cfg(test)]
     pub fn audit_cash(
         &mut self,
         counted_tickets: u32,
@@ -1002,12 +1055,12 @@ impl DemoLedger {
         Ok(audit)
     }
 
+    #[cfg(test)]
     pub fn close_cash(
         &mut self,
         operator: impl Into<String>,
         counted_tickets: u32,
         counted_cash_cents: i64,
-        notes: impl Into<String>,
     ) -> Result<&ClosedCashSession, CashError> {
         if counted_cash_cents < 0 {
             return Err(CashError::InvalidCountedCash);
@@ -1069,7 +1122,6 @@ impl DemoLedger {
             expected_ticket_amount_cents,
             audit,
             movement_count,
-            notes: notes.into().trim().to_string(),
         };
 
         self.closed_cash_sessions.push(closed);
@@ -1079,10 +1131,12 @@ impl DemoLedger {
             .expect("closed cash session just pushed"))
     }
 
+    #[cfg(test)]
     pub(crate) fn has_processed_key(&self, key: &str) -> bool {
         self.processed_keys.contains(key)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_attendance_atomic(
         &mut self,
         request: AttendanceRequest,
@@ -1151,6 +1205,8 @@ impl DemoLedger {
                 recorded_at: recorded_at.clone(),
             };
             cash.movements.push(ticket_mov.clone());
+            cash.expected_tickets += tickets_count;
+            cash.expected_ticket_amount_cents += ticket_amount_cents;
             self.ticket_movements.push(ticket_mov);
 
             self.cash_movements.push(CashMovement {
@@ -1182,6 +1238,10 @@ impl DemoLedger {
 
         self.processed_keys.insert(idempotency_key.clone());
 
+        let item_prices = items
+            .iter()
+            .map(|item| item.menu.unit_cents(item.meal))
+            .collect();
         let record = AttendanceRecord {
             id: attendance_id,
             idempotency_key,
@@ -1191,6 +1251,10 @@ impl DemoLedger {
             breakfasts,
             lunches,
             items,
+            item_prices,
+            has_consumptions: true,
+            has_payments: true,
+            has_balance: true,
             picked_up_by,
             consumption_cents,
             tickets_count,
@@ -1209,12 +1273,14 @@ impl DemoLedger {
         record
     }
 
+    #[cfg(test)]
     fn next_cash_movement_code(&mut self) -> String {
         let code = format!("MOV-{:04}", self.next_cash_movement_seq);
         self.next_cash_movement_seq += 1;
         code
     }
 
+    #[cfg(test)]
     fn next_timestamp(&mut self, date: CalendarDate) -> String {
         let seq = self.next_event_seq;
         self.next_event_seq += 1;
@@ -1224,6 +1290,7 @@ impl DemoLedger {
     }
 }
 
+#[cfg(test)]
 fn build_audit(
     expected_tickets: u32,
     counted_tickets: u32,
@@ -1277,58 +1344,518 @@ pub fn parse_soles_to_cents(raw: &str) -> Option<i64> {
     whole.checked_mul(100)?.checked_add(frac)
 }
 
-/// Entidad reactiva compartida que expone `DemoLedger` a todas las vistas de GPUI.
-pub struct ComedorStore {
-    ledger: DemoLedger,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DataLoad {
+    #[default]
+    Idle,
+    Loading,
+    Ready,
+    Failed,
 }
+
+pub struct DiningDataChanged;
+type DateRange = (CalendarDate, CalendarDate);
+const SYNC_INTERVAL: Duration = Duration::from_secs(6 * 60);
+
+/// Entidad reactiva compartida que expone `DiningLedger` a todas las vistas de GPUI.
+pub struct ComedorStore {
+    ledger: DiningLedger,
+    api: Option<DiningApi>,
+    session: Option<Entity<SessionState>>,
+    user: Option<SessionUser>,
+    generation: u64,
+    connection_error: Option<String>,
+    versions: Option<DiningVersions>,
+    sync_task: Option<Task<()>>,
+    pensioners: QueryCache<(), ()>,
+    attendances: QueryCache<(), ()>,
+    cash: QueryCache<(), ()>,
+    dashboard: QueryCache<DateRange, DashboardData>,
+    reports: QueryCache<DateRange, Vec<DailyActivity>>,
+    histories: QueryCache<PensionerId, PensionerHistory>,
+    identified_pensioners: QueryCache<PensionerId, Pensioner>,
+}
+
+impl EventEmitter<DiningDataChanged> for ComedorStore {}
 
 impl ComedorStore {
     pub fn new() -> Self {
         Self {
-            ledger: DemoLedger::new(),
+            ledger: DiningLedger::empty(),
+            api: None,
+            session: None,
+            user: None,
+            generation: 0,
+            connection_error: None,
+            versions: None,
+            sync_task: None,
+            pensioners: QueryCache::default(),
+            attendances: QueryCache::default(),
+            cash: QueryCache::default(),
+            dashboard: QueryCache::default(),
+            reports: QueryCache::default(),
+            histories: QueryCache::default(),
+            identified_pensioners: QueryCache::default(),
         }
     }
 
-    pub fn ledger(&self) -> &DemoLedger {
+    pub fn ledger(&self) -> &DiningLedger {
         &self.ledger
     }
 
-    pub fn set_ticket_value_cents(
-        &mut self,
-        cents: i64,
-        cx: &mut Context<Self>,
-    ) -> Result<(), CashError> {
-        self.ledger.set_ticket_value_cents(cents)?;
-        cx.notify();
-        Ok(())
+    pub fn sync_error(&self, route: AppRoute) -> Option<&str> {
+        self.connection_error.as_deref().or_else(|| {
+            let query = match route {
+                AppRoute::Pensioners => self.pensioners.get(()),
+                AppRoute::Consumptions => self.attendances.get(()),
+                AppRoute::Cash => self.cash.get(()),
+                _ => None,
+            };
+            query.and_then(|query| query.error.as_deref())
+        })
     }
 
-    pub fn save_pensioner(
+    pub fn pensioners_load(&self) -> DataLoad {
+        self.pensioners
+            .get(())
+            .map_or(DataLoad::Idle, CachedQuery::status)
+    }
+
+    pub fn has_valid_pensioner_catalog(&self) -> bool {
+        self.pensioners.get(()).is_some_and(CachedQuery::is_valid)
+    }
+
+    pub fn attendances_load(&self) -> DataLoad {
+        self.attendances
+            .get(())
+            .map_or(DataLoad::Idle, CachedQuery::status)
+    }
+
+    pub fn cash_load(&self) -> DataLoad {
+        self.cash
+            .get(())
+            .map_or(DataLoad::Idle, CachedQuery::status)
+    }
+
+    pub fn dashboard(&self, range: DateRange) -> Option<&CachedQuery<DashboardData>> {
+        self.dashboard.get(range)
+    }
+
+    pub fn daily_activity(&self, range: DateRange) -> Option<&CachedQuery<Vec<DailyActivity>>> {
+        self.reports.get(range)
+    }
+
+    pub fn pensioner_history(&self, id: PensionerId) -> Option<&CachedQuery<PensionerHistory>> {
+        self.histories.get(id)
+    }
+
+    pub fn identified_pensioner(&self, id: PensionerId) -> Option<&CachedQuery<Pensioner>> {
+        self.identified_pensioners.get(id)
+    }
+
+    pub fn authenticated(&self) -> bool {
+        self.api.is_some()
+    }
+
+    pub fn can_view_reports(&self, cx: &gpui_kit::App) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).can_access_route(AppRoute::Reports))
+    }
+
+    pub fn search_uses_directory(&self, cx: &gpui_kit::App) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            let session = session.read(cx);
+            session.can_view_pensioner_directory() || !session.can_register_attendance()
+        })
+    }
+
+    pub fn remember_search_result(&mut self, pensioner: Pensioner, cx: &mut Context<Self>) {
+        if self.remember_pensioner(pensioner) {
+            cx.notify();
+        }
+    }
+
+    fn remember_pensioner(&mut self, pensioner: Pensioner) -> bool {
+        if self.ledger.find_pensioner(pensioner.id).is_none() {
+            self.ledger.pensioners.push(pensioner);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_cash_snapshot(&mut self, snapshot: CashSnapshot) {
+        self.ledger.active_cash = snapshot.active;
+        self.ledger.closed_cash_sessions = snapshot.closed;
+        self.ledger.cash_movements = snapshot.movements;
+        self.ledger.ticket_value_cents = snapshot.ticket_value_cents;
+    }
+
+    pub fn configure_remote(
         &mut self,
-        id: Option<PensionerId>,
-        draft: PensionerDraft,
+        session: Entity<SessionState>,
         cx: &mut Context<Self>,
-    ) -> Result<PensionerId, &'static str> {
-        let id = self.ledger.save_pensioner(id, draft)?;
+    ) -> bool {
+        let current = session.read(cx);
+        let credentials = current.api_base_url().zip(current.access_token());
+        let same_session = credentials.is_some_and(|(_, token)| {
+            self.api
+                .as_ref()
+                .is_some_and(|api| api.matches_token(token))
+        });
+        let user = current.current_user().cloned();
+        let same_access = self
+            .user
+            .as_ref()
+            .zip(user.as_ref())
+            .is_some_and(|(old, new)| {
+                old.id == new.id
+                    && old.permissions == new.permissions
+                    && old.granted_permissions == new.granted_permissions
+                    && old.roles == new.roles
+                    && old.can_manage_access == new.can_manage_access
+            });
+        let changed = !same_session || !same_access;
+        if changed {
+            self.generation += 1;
+            self.ledger = DiningLedger::empty();
+            self.pensioners = QueryCache::default();
+            self.attendances = QueryCache::default();
+            self.cash = QueryCache::default();
+            self.dashboard = QueryCache::default();
+            self.reports = QueryCache::default();
+            self.histories = QueryCache::default();
+            self.identified_pensioners = QueryCache::default();
+            self.user = user;
+            if !same_session {
+                self.versions = current.dining_versions().cloned();
+            }
+            self.connection_error = None;
+            self.api = credentials.and_then(|(base, token)| match DiningApi::new(base, token) {
+                Ok(api) => Some(api),
+                Err(error) => {
+                    self.connection_error = Some(error.user_message());
+                    None
+                }
+            });
+        }
+        self.session = Some(session);
+        if changed {
+            self.sync_task = self.authenticated().then(|| {
+                cx.spawn(async move |store, cx| {
+                    loop {
+                        cx.background_executor().timer(SYNC_INTERVAL).await;
+                        if store
+                            .update(cx, |store, cx| store.check_versions(cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            });
+        }
         cx.notify();
-        Ok(id)
+        changed
+    }
+
+    fn check_versions(&self, cx: &mut Context<Self>) {
+        self.request(
+            DiningApi::versions,
+            |store, result, cx| {
+                if let Ok(versions) = result
+                    && store.apply_versions(versions)
+                {
+                    cx.emit(DiningDataChanged);
+                    cx.notify();
+                }
+            },
+            cx,
+        );
+    }
+
+    fn apply_versions(&mut self, versions: DiningVersions) -> bool {
+        let previous = self.versions.replace(versions.clone());
+        if previous.as_ref() == Some(&versions) {
+            return false;
+        }
+        let previous = previous.as_ref();
+        if previous.and_then(|old| old.pensioners) != versions.pensioners {
+            self.pensioners.invalidate(|_| true);
+            self.histories.invalidate(|_| true);
+        }
+        if previous.and_then(|old| old.attendances) != versions.attendances {
+            self.attendances.invalidate(|_| true);
+        }
+        if previous.and_then(|old| old.cash) != versions.cash {
+            self.cash.invalidate(|_| true);
+        }
+        if previous.and_then(|old| old.reports) != versions.reports {
+            self.reports.invalidate(|_| true);
+        }
+        if previous.map(|old| &old.dashboard) != Some(&versions.dashboard) {
+            self.dashboard.invalidate(|_| true);
+        }
+        true
+    }
+
+    pub fn request<T: Send + 'static>(
+        &self,
+        request: impl FnOnce(&DiningApi) -> Result<T, ApiError> + Send + 'static,
+        complete: impl FnOnce(&mut Self, Result<T, ApiError>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let api = self.api.clone();
+        let generation = self.generation;
+        let background = cx.background_executor().spawn(async move {
+            let api = api.ok_or_else(|| {
+                ApiError::Unauthorized("Inicia sesión para conectar con Laravel.".into())
+            })?;
+            request(&api)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = background.await;
+            let _ = this.update(cx, |store, cx| {
+                if store.generation != generation || !store.session_is_current(cx) {
+                    return;
+                }
+                if let Err(error) = &result
+                    && error.is_unauthorized()
+                    && let Some(session) = store.session.as_ref()
+                {
+                    session.update(cx, |session, cx| {
+                        session.expire_session(error.user_message(), cx)
+                    });
+                }
+                complete(store, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn session_is_current(&self, cx: &gpui_kit::App) -> bool {
+        match (
+            &self.api,
+            self.session
+                .as_ref()
+                .and_then(|session| session.read(cx).access_token()),
+        ) {
+            (Some(api), Some(token)) => api.matches_token(token),
+            (None, _) => true,
+            _ => false,
+        }
+    }
+
+    fn load<K, T, V>(
+        &mut self,
+        cache: fn(&mut Self) -> &mut QueryCache<K, V>,
+        key: K,
+        force: bool,
+        fetch: impl FnOnce(&DiningApi, K) -> Result<T, ApiError> + Send + 'static,
+        apply: impl FnOnce(&mut Self, T) -> V + 'static,
+        cx: &mut Context<Self>,
+    ) where
+        K: Copy + Eq + Hash + Send + 'static,
+        T: Send + 'static,
+        V: 'static,
+    {
+        if !self.authenticated() {
+            return;
+        }
+        let Some(request) = cache(self).begin(key, force) else {
+            return;
+        };
+        self.request(
+            move |api| fetch(api, key),
+            move |store, result, cx| {
+                if !cache(store).is_pending(key, request) {
+                    return;
+                }
+                let result = result
+                    .map(|value| apply(store, value))
+                    .map_err(|error| error.user_message());
+                cache(store).complete(key, result);
+                cx.notify();
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn load_pensioners(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else { return };
+        let session = session.read(cx);
+        let directory = session.can_view_pensioner_directory();
+        if directory || session.can_register_attendance() {
+            self.load(
+                |store| &mut store.pensioners,
+                (),
+                force,
+                move |api, ()| api.pensioners(directory),
+                |store, rows| store.ledger.pensioners = rows,
+                cx,
+            );
+        }
+    }
+
+    pub fn load_attendances(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).can_view_attendances())
+        {
+            self.load(
+                |store| &mut store.attendances,
+                (),
+                force,
+                |api, ()| api.attendances(),
+                |store, mut rows| {
+                    rows.sort_by_key(|row| row.id);
+                    store.ledger.attendances = rows;
+                },
+                cx,
+            );
+        }
+    }
+
+    pub fn load_cash(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).can_access_route(AppRoute::Cash))
+        {
+            self.load(
+                |store| &mut store.cash,
+                (),
+                force,
+                |api, ()| api.cash(),
+                Self::apply_cash_snapshot,
+                cx,
+            );
+        }
+    }
+
+    pub fn load_dashboard(&mut self, range: DateRange, force: bool, cx: &mut Context<Self>) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).can_access_dashboard())
+        {
+            self.load(
+                |store| &mut store.dashboard,
+                range,
+                force,
+                |api, (from, to)| api.dashboard(from, to),
+                |_, data| data,
+                cx,
+            );
+        }
+    }
+
+    pub fn load_daily_activity(&mut self, range: DateRange, force: bool, cx: &mut Context<Self>) {
+        if self.can_view_reports(cx) {
+            self.load(
+                |store| &mut store.reports,
+                range,
+                force,
+                |api, (from, to)| api.daily_activity(from, to),
+                |_, data| data,
+                cx,
+            );
+        }
+    }
+
+    pub fn load_pensioner_history(&mut self, id: PensionerId, force: bool, cx: &mut Context<Self>) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).can_view_pensioner_directory())
+        {
+            self.load(
+                |store| &mut store.histories,
+                id,
+                force,
+                DiningApi::pensioner_history,
+                |store, history| {
+                    store.remember_pensioner(history.pensioner.clone());
+                    history
+                },
+                cx,
+            );
+        }
+    }
+
+    pub fn load_identified_pensioner(&mut self, id: PensionerId, cx: &mut Context<Self>) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.read(cx).can_access_route(AppRoute::Identification))
+        {
+            self.load(
+                |store| &mut store.identified_pensioners,
+                id,
+                true,
+                DiningApi::identified_pensioner,
+                |_, pensioner| pensioner,
+                cx,
+            );
+        }
+    }
+
+    pub fn cash_changed(&mut self, cx: &mut Context<Self>) {
+        self.cash.invalidate(|_| true);
+        self.dashboard.invalidate(|_| true);
+        cx.emit(DiningDataChanged);
+        cx.notify();
+    }
+
+    pub fn attendance_changed(&mut self, record: &AttendanceRecord, cx: &mut Context<Self>) {
+        self.pensioners.invalidate(|_| true);
+        self.attendances.invalidate(|_| true);
+        if record.tickets_count > 0 || record.movement_code.is_some() {
+            self.cash.invalidate(|_| true);
+        }
+        self.dashboard.invalidate(|_| true);
+        self.reports
+            .invalidate(|(from, to)| (*from..=*to).contains(&record.date));
+        self.histories.invalidate(|id| *id == record.pensioner_id);
+        self.identified_pensioners
+            .invalidate(|id| *id == record.pensioner_id);
+        cx.emit(DiningDataChanged);
+        cx.notify();
+    }
+
+    fn pensioner_changed(&mut self, id: PensionerId, cx: &mut Context<Self>) {
+        self.pensioners.invalidate(|_| true);
+        self.dashboard.invalidate(|_| true);
+        self.histories.invalidate(|stored| *stored == id);
+        self.identified_pensioners
+            .invalidate(|stored| *stored == id);
+        cx.emit(DiningDataChanged);
+        cx.notify();
+    }
+
+    pub fn update_pensioner(&mut self, pensioner: Pensioner, cx: &mut Context<Self>) {
+        let id = pensioner.id;
+        if let Some(entry) = self
+            .ledger
+            .pensioners
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        {
+            *entry = pensioner;
+        } else {
+            self.ledger.pensioners.push(pensioner);
+        }
+        self.pensioner_changed(id, cx);
     }
 
     pub fn set_pensioner_active(&mut self, id: PensionerId, active: bool, cx: &mut Context<Self>) {
         if let Some(pensioner) = self.ledger.pensioners.iter_mut().find(|p| p.id == id) {
             pensioner.active = active;
-            cx.notify();
         }
-    }
-
-    pub fn confirm_attendance(
-        &mut self,
-        request: AttendanceRequest,
-        cx: &mut Context<Self>,
-    ) -> Result<AttendanceRecord, AttendanceError> {
-        let record = execute_confirm_attendance(&mut self.ledger, request)?;
-        cx.notify();
-        Ok(record)
+        self.pensioner_changed(id, cx);
     }
 
     pub fn set_fingerprint_enrolled(
@@ -1337,55 +1864,19 @@ impl ComedorStore {
         enrolled: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.ledger.set_fingerprint_enrolled(id, enrolled) {
-            cx.notify();
-        }
-    }
-
-    pub fn open_cash(
-        &mut self,
-        operator: impl Into<String>,
-        opening_cash_cents: i64,
-        cx: &mut Context<Self>,
-    ) -> Result<(), CashError> {
-        self.ledger.open_cash(operator, opening_cash_cents)?;
-        cx.notify();
-        Ok(())
-    }
-
-    pub fn audit_cash(
-        &mut self,
-        counted_tickets: u32,
-        counted_cash_cents: i64,
-        cx: &mut Context<Self>,
-    ) -> Result<CashAuditRecord, CashError> {
-        let audit = self
-            .ledger
-            .audit_cash(counted_tickets, counted_cash_cents)?;
-        cx.notify();
-        Ok(audit)
-    }
-
-    pub fn close_cash(
-        &mut self,
-        operator: impl Into<String>,
-        counted_tickets: u32,
-        counted_cash_cents: i64,
-        notes: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) -> Result<(), CashError> {
-        self.ledger
-            .close_cash(operator, counted_tickets, counted_cash_cents, notes)?;
-        cx.notify();
-        Ok(())
+        self.ledger.set_fingerprint_enrolled(id, enrolled);
+        self.pensioner_changed(id, cx);
     }
 }
+
+#[cfg(test)]
+pub type DemoLedger = DiningLedger;
 
 #[cfg(test)]
 mod tests {
     use super::{
         BREAKFAST_PRICE_CENTS, CalendarDate, CashError, CashMovementKind,
-        DEFAULT_TICKET_VALUE_CENTS, DatePeriodFilter, DemoLedger, LUNCH_PRICE_CENTS,
+        DEFAULT_TICKET_VALUE_CENTS, DatePeriodFilter, DiningLedger, LUNCH_PRICE_CENTS,
         parse_soles_to_cents,
     };
     use crate::features::{
@@ -1400,8 +1891,60 @@ mod tests {
     };
 
     #[test]
+    fn version_check_preserves_unchanged_cache_entries_and_reloads_only_affected_modules() {
+        use super::{ComedorStore, DashboardData, DiningVersions};
+
+        let mut store = ComedorStore::new();
+        let baseline = DiningVersions {
+            dashboard: "0:0:0".into(),
+            pensioners: Some(0),
+            attendances: Some(0),
+            cash: Some(0),
+            reports: Some(0),
+        };
+        store.versions = Some(baseline.clone());
+        let today = CalendarDate::new(2026, 11, 26).unwrap();
+        let range = (today, today);
+        store.pensioners.begin((), false);
+        store.pensioners.complete((), Ok(()));
+        store.attendances.begin((), false);
+        store.attendances.complete((), Ok(()));
+        store.cash.begin((), false);
+        store.cash.complete((), Ok(()));
+        store.reports.begin(range, false);
+        store.reports.complete(range, Ok(Vec::new()));
+        store.dashboard.begin(range, false);
+        store.dashboard.complete(
+            range,
+            Ok(DashboardData {
+                consumptions: None,
+                tickets: None,
+                pensioners: None,
+                cash: None,
+            }),
+        );
+
+        assert!(!store.apply_versions(baseline.clone()));
+        assert_eq!(store.cash.begin((), false), None);
+        assert_eq!(store.dashboard.begin(range, false), None);
+
+        let cash_changed = DiningVersions {
+            dashboard: "0:0:1".into(),
+            cash: Some(1),
+            ..baseline
+        };
+        assert!(store.apply_versions(cash_changed.clone()));
+        assert_eq!(store.pensioners.begin((), false), None);
+        assert_eq!(store.attendances.begin((), false), None);
+        assert_eq!(store.reports.begin(range, false), None);
+        assert!(store.cash.begin((), false).is_some());
+        assert!(store.dashboard.begin(range, false).is_some());
+        assert!(!store.apply_versions(cash_changed));
+    }
+
+    #[test]
     fn editing_a_profile_preserves_biometric_and_account_state() {
-        let mut ledger = DemoLedger::new();
+        let mut ledger = DiningLedger::new();
         let id = PensionerId(1001);
         let before = ledger.find_pensioner(id).unwrap().clone();
         let mut draft = PensionerDraft::from(&before);
@@ -1416,13 +1959,11 @@ mod tests {
         assert_eq!(after.tickets_balance, before.tickets_balance);
         assert_eq!(after.fingerprint_enrolled, before.fingerprint_enrolled);
         assert_eq!(after.active, before.active);
-        assert_eq!(after.plan, before.plan);
-        assert_eq!(after.notes, before.notes);
     }
 
     #[test]
     fn creating_profiles_validates_contact_data_and_allocates_a_unique_code() {
-        let mut ledger = DemoLedger::new();
+        let mut ledger = DiningLedger::new();
         let previous_count = ledger.pensioners().len();
         let draft = |dni: &str, phone: &str| PensionerDraft {
             full_name: "Nuevo pensionista".into(),
@@ -1457,7 +1998,7 @@ mod tests {
 
     #[test]
     fn cash_lifecycle_tracks_opening_cash_payments_tickets_and_closing_audit() {
-        let mut ledger = DemoLedger::new();
+        let mut ledger = DiningLedger::new();
         assert!(!ledger.is_cash_open());
         assert_eq!(ledger.audit_cash(0, 0), Err(CashError::NotOpen));
         assert_eq!(
@@ -1501,7 +2042,7 @@ mod tests {
         assert!(audit.is_balanced());
 
         let closed = ledger
-            .close_cash("Operador", 2, 11_000, "Diferencia de prueba")
+            .close_cash("Operador", 2, 11_000)
             .expect("close cash");
         assert!(!closed.audit.is_balanced());
         assert_eq!(closed.audit.cash_diff_cents, -500);
@@ -1530,7 +2071,7 @@ mod tests {
         assert!(CalendarDate::parse_iso("2026-02-29").is_none());
         assert!(CalendarDate::parse_iso("2024-02-29").is_some());
 
-        let mut ledger = DemoLedger::new();
+        let mut ledger = DiningLedger::new();
         ledger.set_test_date(oct_20);
         ledger.open_cash("Operador", 5_000).expect("open cash");
         confirm_attendance(

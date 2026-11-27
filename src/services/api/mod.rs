@@ -1,8 +1,9 @@
 pub mod auth;
+pub mod dining;
 
 use std::{collections::BTreeMap, sync::OnceLock, time::Duration};
 
-use reqwest::blocking::Client;
+use reqwest::{Method, blocking::Client};
 use serde::{Deserialize, Serialize};
 
 use crate::services::preferences::validate_api_base_url;
@@ -130,6 +131,65 @@ impl ApiClient {
             ApiError::Decode(format!("No se pudo serializar la solicitud JSON: {err}"))
         })
     }
+
+    fn authenticated_json<T: serde::de::DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> Result<T, ApiError> {
+        let mut request = shared_reqwest_client()?
+            .request(method, self.url(path))
+            .bearer_auth(token)
+            .header("Accept", "application/json")
+            .query(query);
+        if let Some(body) = body {
+            request = request
+                .header("Content-Type", "application/json")
+                .body(body.to_string());
+        }
+        let response = request
+            .send()
+            .map_err(|err| map_transport_error(&self.base_url, err))?;
+        decode_authenticated_response(read_response(response)?)
+    }
+}
+
+fn decode_authenticated_response<T: serde::de::DeserializeOwned>(
+    response: HttpResponse,
+) -> Result<T, ApiError> {
+    match response.status {
+        200..=299 => serde_json::from_str(&response.body).map_err(|err| {
+            ApiError::Decode(format!(
+                "El formato de respuesta del servidor no es válido: {err}"
+            ))
+        }),
+        status @ 500..=599 => Err(ApiError::Server(
+            status,
+            "El servidor del comedor no pudo completar la operación. Intenta nuevamente.".into(),
+        )),
+        status => {
+            let message = parse_laravel_error_message(&response.body).unwrap_or_default();
+            match status {
+                401 => Err(ApiError::Unauthorized(
+                    "Tu sesión expiró. Inicia sesión nuevamente.".into(),
+                )),
+                403 => Err(ApiError::Forbidden(if message.is_empty() {
+                    "Tu sesión no tiene permiso para realizar esta operación.".into()
+                } else {
+                    message
+                })),
+                429 => Err(ApiError::RateLimited(if message.is_empty() {
+                    "Se realizaron demasiadas solicitudes. Intenta en un momento.".into()
+                } else {
+                    message
+                })),
+                status => Err(ApiError::Server(status, message)),
+            }
+        }
+    }
 }
 
 impl HttpTransport for ApiClient {
@@ -227,7 +287,7 @@ pub fn parse_laravel_error_message(body: &str) -> Option<String> {
 
 /// Ejecuta una operación autenticada siguiendo el contrato `401 -> refresh -> reintento o expiración`.
 ///
-/// En Laravel Sanctum no existe endpoint `/api/refresh`, por lo que el callback `refresh`
+/// En Laravel Sanctum no existe endpoint `/api/auth/refresh`, por lo que el callback `refresh`
 /// devuelve `Ok(None)` y la sesión expira ordenadamente devolviendo `ApiError::Unauthorized`.
 /// Si en el futuro el backend habilita renovación de token, la función reintenta una sola vez
 /// con el nuevo token y lo retorna al llamador para actualizar `SessionState`.
@@ -257,23 +317,43 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiClient, ApiError, execute_with_auth_retry, parse_laravel_error_message};
+    use super::{
+        ApiClient, ApiError, HttpResponse, decode_authenticated_response, execute_with_auth_retry,
+        parse_laravel_error_message,
+    };
+
+    #[test]
+    fn hides_database_details_from_internal_server_errors() {
+        let error = decode_authenticated_response::<serde_json::Value>(HttpResponse {
+            status: 500,
+            body: r#"{"message":"SQLSTATE[HY000]: no such table: attendances"}"#.into(),
+        })
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Server(500, _)));
+        assert!(!error.user_message().contains("SQLSTATE"));
+    }
 
     #[test]
     fn normalizes_api_urls_without_duplicating_prefix() {
         let plain = ApiClient::new("http://localhost:8000/").expect("valid url");
-        assert_eq!(plain.url("/api/login"), "http://localhost:8000/api/login");
+        assert_eq!(
+            plain.url("/api/auth/login"),
+            "http://localhost:8000/api/auth/login"
+        );
 
         let with_api = ApiClient::new("http://localhost:8000/api").expect("valid url");
-        assert_eq!(with_api.url("/api/user"), "http://localhost:8000/api/user");
+        assert_eq!(
+            with_api.url("/api/auth/me"),
+            "http://localhost:8000/api/auth/me"
+        );
     }
 
     #[test]
     fn extracts_first_laravel_validation_error_or_message() {
-        let validation = r#"{"message":"The given data was invalid.","errors":{"email":["Las credenciales proporcionadas son incorrectas."]}}"#;
+        let validation = r#"{"message":"The given data was invalid.","errors":{"email":["Las credenciales proporcionadas no coinciden con nuestros registros."]}}"#;
         assert_eq!(
             parse_laravel_error_message(validation).as_deref(),
-            Some("Las credenciales proporcionadas son incorrectas.")
+            Some("Las credenciales proporcionadas no coinciden con nuestros registros.")
         );
 
         let generic = r#"{"message":"Unauthenticated."}"#;

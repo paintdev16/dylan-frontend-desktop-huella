@@ -6,7 +6,7 @@ use std::{
 use gpui_kit::{Context, EventEmitter};
 
 use crate::{
-    services::biometric::{BiometricBackendMode, BiometricConfig, storage::default_backup_path},
+    services::biometric::{BiometricConfig, storage::default_backup_path},
     theme::ThemePreference,
 };
 
@@ -23,7 +23,6 @@ pub struct AppPreferences {
     pub remembered_email: Option<String>,
     pub station_name: String,
     pub api_base_url: String,
-    pub biometric_mode: BiometricBackendMode,
     pub fdx_dll_path: String,
     pub secusearch_dll_path: String,
 }
@@ -35,7 +34,6 @@ impl Default for AppPreferences {
             remembered_email: None,
             station_name: DEFAULT_STATION_NAME.to_string(),
             api_base_url: DEFAULT_API_BASE_URL.to_string(),
-            biometric_mode: BiometricBackendMode::Simulated,
             fdx_dll_path: String::new(),
             secusearch_dll_path: String::new(),
         }
@@ -174,10 +172,9 @@ pub fn serialize_preferences(prefs: &AppPreferences) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\n  \"theme\": \"{theme}\",\n  \"remembered_email\": {remembered},\n  \"station_name\": \"{}\",\n  \"api_base_url\": \"{}\",\n  \"biometric_mode\": \"{}\",\n  \"fdx_dll_path\": \"{}\",\n  \"secusearch_dll_path\": \"{}\"\n}}\n",
+        "{{\n  \"theme\": \"{theme}\",\n  \"remembered_email\": {remembered},\n  \"station_name\": \"{}\",\n  \"api_base_url\": \"{}\",\n  \"fdx_dll_path\": \"{}\",\n  \"secusearch_dll_path\": \"{}\"\n}}\n",
         escape_json_str(&prefs.station_name),
         escape_json_str(&prefs.api_base_url),
-        prefs.biometric_mode.as_str(),
         escape_json_str(&prefs.fdx_dll_path),
         escape_json_str(&prefs.secusearch_dll_path),
     )
@@ -222,11 +219,6 @@ pub fn parse_preferences(raw: &str) -> AppPreferences {
                     && let Ok(valid) = validate_api_base_url(&url)
                 {
                     prefs.api_base_url = valid;
-                }
-            }
-            "biometric_mode" => {
-                if let Some(mode) = unquote_json_str(val) {
-                    prefs.biometric_mode = BiometricBackendMode::from_str(&mode);
                 }
             }
             "fdx_dll_path" => {
@@ -333,6 +325,10 @@ impl PreferencesStore {
         &self.preferences
     }
 
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -390,12 +386,10 @@ impl PreferencesStore {
 
     pub fn update_biometric(
         &mut self,
-        mode: BiometricBackendMode,
         fdx_dll_path: &str,
         secusearch_dll_path: &str,
         cx: &mut Context<Self>,
     ) {
-        self.preferences.biometric_mode = mode;
         self.preferences.fdx_dll_path = fdx_dll_path.trim().to_string();
         self.preferences.secusearch_dll_path = secusearch_dll_path.trim().to_string();
         self.last_error = None;
@@ -436,7 +430,7 @@ mod tests {
         AppPreferences, DEFAULT_API_BASE_URL, load_preferences_from, parse_preferences,
         save_preferences_to, serialize_preferences, validate_api_base_url,
     };
-    use crate::{services::biometric::BiometricBackendMode, theme::ThemePreference};
+    use crate::theme::ThemePreference;
 
     #[test]
     fn round_trips_preferences_on_disk_and_never_serializes_secrets() {
@@ -449,7 +443,6 @@ mod tests {
             remembered_email: Some("admin@dylan.pe".into()),
             station_name: "Estación Comedor \"Norte\"".into(),
             api_base_url: "https://api.dylan.pe".into(),
-            biometric_mode: BiometricBackendMode::SecuGen,
             fdx_dll_path: "C:\\SecuGen\\sgfplib.dll".into(),
             secusearch_dll_path: "C:\\SecuGen\\secusearchapi.dll".into(),
         };
@@ -465,6 +458,21 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn reads_sdk_paths_from_preferences_with_a_legacy_mode() {
+        let parsed = parse_preferences(
+            r#"{
+            "biometric_mode": "simulated",
+            "fdx_dll_path": "C:/SecuGen/sgfplib.dll",
+            "secusearch_dll_path": "C:/SecuGen/secusearchapi.dll"
+        }"#,
+        );
+
+        assert_eq!(parsed.fdx_dll_path, "C:/SecuGen/sgfplib.dll");
+        assert_eq!(parsed.secusearch_dll_path, "C:/SecuGen/secusearchapi.dll");
+        assert!(!serialize_preferences(&parsed).contains("biometric_mode"));
     }
 
     #[test]

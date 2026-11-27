@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     services::api::{
@@ -7,6 +7,8 @@ use crate::{
     state::session::SessionPermissions,
 };
 
+use super::dining::DiningVersions;
+
 #[derive(Debug, Serialize)]
 struct LoginRequest<'a> {
     email: &'a str,
@@ -14,12 +16,29 @@ struct LoginRequest<'a> {
     device_name: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct ApiRole {
-    pub id: u64,
-    pub name: String,
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RoleEntry {
+    Name(String),
+    Object { name: String },
 }
 
+fn deserialize_roles<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let entries = Option::<Vec<RoleEntry>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .map(|entry| match entry {
+            RoleEntry::Name(name) => name,
+            RoleEntry::Object { name } => name,
+        })
+        .collect())
+}
+
+/// Usuario devuelto por `App\Http\Resources\Api\Auth\UserResource` en
+/// `dylan-starter-kit-laravel-react`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ApiUser {
     pub id: u64,
@@ -27,15 +46,16 @@ pub struct ApiUser {
     pub email: String,
     #[serde(default)]
     pub email_verified_at: Option<String>,
-    #[serde(default)]
-    pub roles: Vec<ApiRole>,
-    /// Campo opcional para permisos explícitos de Spatie cuando el backend los incluya en `/api/login` o `/api/user`.
+    /// Lista de nombres de roles Spatie (`["super-admin"]`, `["admin"]`, `["client"]`, etc.).
+    #[serde(default, deserialize_with = "deserialize_roles")]
+    pub roles: Vec<String>,
+    /// Lista completa de permisos efectivos Spatie (`$user->getAllPermissions()->pluck('name')`).
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(default)]
-    pub can_manage_access: bool,
+    pub created_at: Option<String>,
     #[serde(default)]
-    pub is_super_admin: bool,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -46,6 +66,8 @@ struct LoginResponse {
     #[serde(default)]
     token_type: String,
     user: ApiUser,
+    #[serde(default)]
+    dining_versions: Option<DiningVersions>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -53,23 +75,28 @@ struct MeResponse {
     user: ApiUser,
 }
 
-/// Sesión devuelta por `POST /api/login` del backend Laravel Sanctum.
+/// Sesión devuelta por `POST /api/auth/login` del backend Laravel Sanctum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedSession {
     pub token: String,
     pub token_type: String,
     pub user: ApiUser,
+    pub dining_versions: Option<DiningVersions>,
 }
 
 impl ApiUser {
     pub fn role_names(&self) -> Vec<String> {
-        self.roles.iter().map(|role| role.name.clone()).collect()
+        self.roles.clone()
+    }
+
+    pub fn permission_names(&self) -> Vec<String> {
+        self.permissions.clone()
     }
 
     pub fn has_role(&self, expected: &str) -> bool {
         self.roles
             .iter()
-            .any(|role| role.name.eq_ignore_ascii_case(expected))
+            .any(|role| role.eq_ignore_ascii_case(expected))
     }
 
     pub fn has_permission(&self, expected: &str) -> bool {
@@ -78,32 +105,43 @@ impl ApiUser {
             .any(|permission| permission.eq_ignore_ascii_case(expected))
     }
 
+    pub fn is_super_admin(&self) -> bool {
+        self.has_role("super-admin")
+    }
+
+    pub fn can_manage_access(&self) -> bool {
+        self.is_super_admin()
+            || self.has_role("admin")
+            || self.has_permission("manage.access")
+            || self.has_permission("manage access")
+    }
+
     pub fn primary_role_label(&self) -> String {
-        if self.is_super_admin || self.has_role("super-admin") {
+        if self.is_super_admin() {
             return "Super Admin".to_string();
         }
         if self.has_role("admin") {
             return "Administrador".to_string();
         }
         if let Some(first) = self.roles.first() {
-            return match first.name.to_ascii_lowercase().as_str() {
+            return match first.to_ascii_lowercase().as_str() {
                 "client" => "Cliente".to_string(),
-                _ => first.name.clone(),
+                "cajero" => "Cajero".to_string(),
+                _ => first.clone(),
             };
         }
         "Operador".to_string()
     }
 }
 
-/// Mapea roles y permisos recibidos desde Laravel + Spatie Permission a los permisos
-/// efectivos del escritorio.
+/// Mapea roles y permisos recibidos desde Laravel + Spatie Permission (`UserResource`)
+/// a los permisos efectivos del escritorio.
 ///
-/// - `super-admin`, `admin` o `can_manage_access` (`manage.access`) habilitan la operación
-///   completa del escritorio.
-/// - Si el backend envía nombres granulares en `permissions`, se habilita cada módulo
-///   correspondiente.
-/// - Un usuario autenticado con rol básico (ej. `client`) solo accede al Dashboard y queda
-///   bloqueado de módulos operativos, administrativos y de configuración.
+/// - `super-admin`, `admin` o `manage.access` habilitan la operación completa del escritorio.
+/// - Si el backend envía permisos granulares en `permissions` (catálogo de acceso o módulos
+///   del comedor), se habilita cada sección correspondiente.
+/// - Un usuario autenticado con rol básico (ej. `client` o sin permisos) solo accede al
+///   Dashboard y queda bloqueado de módulos operativos, administrativos y de configuración.
 pub fn map_permissions(user: &ApiUser) -> SessionPermissions {
     if has_full_access(user) {
         return SessionPermissions::full_access();
@@ -112,17 +150,20 @@ pub fn map_permissions(user: &ApiUser) -> SessionPermissions {
     let pensioners = user.has_permission("pensioners.view")
         || user.has_permission("pensioners.manage")
         || user.has_permission("pensioners.create")
-        || user.has_permission("pensioners.update")
-        || user.has_permission("users.view");
-    let identification =
-        user.has_permission("identification.use") || user.has_permission("attendance.register");
+        || user.has_permission("pensioners.update");
+    let identification = user.has_permission("identification.use");
     let consumptions =
-        user.has_permission("consumptions.view") || user.has_permission("attendance.register");
+        user.has_permission("consumptions.view") || user.has_permission("payments.view");
     let register_attendance = user.has_permission("attendance.register");
     let cash = user.has_permission("cash.manage") || user.has_permission("cash.view");
     let reports = user.has_permission("reports.view");
-    let settings = user.has_permission("settings.manage") || user.has_permission("roles.view");
-    let search_pensioners = pensioners || user.has_permission("pensioners.search");
+    let settings = user.has_permission("settings.manage")
+        || user.has_permission("roles.view")
+        || user.has_permission("permissions.view");
+    let search_pensioners = user.has_permission("pensioners.view")
+        || user.has_permission("pensioners.manage")
+        || user.has_permission("pensioners.search")
+        || register_attendance;
 
     SessionPermissions {
         dashboard: true,
@@ -138,14 +179,10 @@ pub fn map_permissions(user: &ApiUser) -> SessionPermissions {
 }
 
 pub fn has_full_access(user: &ApiUser) -> bool {
-    user.is_super_admin
-        || user.can_manage_access
-        || user.has_role("super-admin")
-        || user.has_role("admin")
-        || user.has_permission("manage.access")
+    user.can_manage_access()
 }
 
-/// Autentica contra `POST /api/login` (Laravel Sanctum).
+/// Autentica contra `POST /api/auth/login` (Laravel Sanctum).
 pub fn login(
     base_url: &str,
     email: &str,
@@ -153,7 +190,7 @@ pub fn login(
     device_name: &str,
 ) -> Result<AuthenticatedSession, ApiError> {
     let client = ApiClient::new(base_url)?;
-    let url = client.url("/api/login");
+    let url = client.url("/api/auth/login");
     login_with_transport(&client, &url, email, password, device_name)
 }
 
@@ -183,7 +220,7 @@ fn login_with_transport(
     let response = transport.post_json(url, None, &payload)?;
 
     match response.status {
-        200 => {
+        200 | 201 => {
             let parsed: LoginResponse = serde_json::from_str(&response.body).map_err(|err| {
                 ApiError::Decode(format!(
                     "La respuesta de inicio de sesión del servidor no tiene el formato esperado: {err}"
@@ -204,6 +241,7 @@ fn login_with_transport(
                 token: parsed.token,
                 token_type,
                 user: parsed.user,
+                dining_versions: parsed.dining_versions,
             })
         }
         401 | 422 => {
@@ -232,10 +270,10 @@ fn login_with_transport(
     }
 }
 
-/// Consulta `GET /api/user` para validar la vigencia del token y sincronizar roles/permisos.
+/// Consulta `GET /api/auth/me` para validar la vigencia del token y sincronizar roles/permisos.
 pub fn fetch_me(base_url: &str, bearer_token: &str) -> Result<ApiUser, ApiError> {
     let client = ApiClient::new(base_url)?;
-    let url = client.url("/api/user");
+    let url = client.url("/api/auth/me");
     fetch_me_with_transport(&client, &url, bearer_token)
 }
 
@@ -287,7 +325,7 @@ fn fetch_me_once(
     }
 }
 
-/// Revoca el token actual en Laravel Sanctum (`POST /api/logout`).
+/// Revoca el token actual en Laravel Sanctum (`POST /api/auth/logout`).
 ///
 /// Un `401` se considera éxito porque el token ya no es válido en el servidor.
 pub fn logout(base_url: &str, bearer_token: &str) -> Result<(), ApiError> {
@@ -295,7 +333,7 @@ pub fn logout(base_url: &str, bearer_token: &str) -> Result<(), ApiError> {
         return Ok(());
     }
     let client = ApiClient::new(base_url)?;
-    let url = client.url("/api/logout");
+    let url = client.url("/api/auth/logout");
     logout_with_transport(&client, &url, bearer_token)
 }
 
@@ -322,7 +360,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        ApiRole, ApiUser, fetch_me_with_transport, login_with_transport, logout_with_transport,
+        ApiUser, fetch_me_with_transport, login_with_transport, logout_with_transport,
         map_permissions,
     };
     use crate::{
@@ -412,19 +450,16 @@ mod tests {
     }
 
     #[test]
-    fn maps_super_admin_admin_and_client_permissions() {
+    fn maps_super_admin_admin_granular_and_client_permissions() {
         let super_admin = ApiUser {
             id: 1,
-            name: "Administrador Principal".into(),
+            name: "Paint".into(),
             email: "paint@gmail.com".into(),
-            email_verified_at: Some("2026-01-01T00:00:00Z".into()),
-            roles: vec![ApiRole {
-                id: 1,
-                name: "super-admin".into(),
-            }],
-            permissions: vec![],
-            can_manage_access: true,
-            is_super_admin: true,
+            email_verified_at: Some("2026-01-01T00:00:00.000000Z".into()),
+            roles: vec!["super-admin".into()],
+            permissions: vec!["manage.access".into()],
+            created_at: None,
+            updated_at: None,
         };
         let perms = map_permissions(&super_admin);
         for route in AppRoute::IMPLEMENTED {
@@ -432,20 +467,37 @@ mod tests {
         }
         assert!(perms.register_attendance);
         assert!(perms.search_pensioners);
+        assert!(super_admin.is_super_admin());
+        assert!(super_admin.can_manage_access());
         assert_eq!(super_admin.primary_role_label(), "Super Admin");
+
+        let granular = ApiUser {
+            id: 3,
+            name: "Auditor".into(),
+            email: "auditor@dylan.pe".into(),
+            email_verified_at: None,
+            roles: vec!["auditor".into()],
+            permissions: vec!["pensioners.view".into(), "permissions.view".into()],
+            created_at: None,
+            updated_at: None,
+        };
+        let granular_perms = map_permissions(&granular);
+        assert!(granular_perms.dashboard);
+        assert!(granular_perms.pensioners);
+        assert!(granular_perms.search_pensioners);
+        assert!(granular_perms.settings);
+        assert!(!granular_perms.cash);
+        assert!(!granular_perms.register_attendance);
 
         let client = ApiUser {
             id: 2,
             name: "Usuario Consulta".into(),
             email: "cliente@dylan.pe".into(),
             email_verified_at: None,
-            roles: vec![ApiRole {
-                id: 3,
-                name: "client".into(),
-            }],
+            roles: vec!["client".into()],
             permissions: vec![],
-            can_manage_access: false,
-            is_super_admin: false,
+            created_at: None,
+            updated_at: None,
         };
         let client_perms = map_permissions(&client);
         assert!(client_perms.dashboard);
@@ -461,26 +513,34 @@ mod tests {
     }
 
     #[test]
-    fn login_succeeds_against_laravel_sanctum_contract() {
+    fn login_succeeds_against_starter_kit_auth_login_contract() {
         let body = r#"{
             "message": "Inicio de sesión exitoso.",
             "token": "1|sanctum_test_token_abc",
             "token_type": "Bearer",
+            "dining_versions": {
+                "dashboard": "2:3:4",
+                "pensioners": 2,
+                "attendances": 3,
+                "cash": 4,
+                "reports": 3
+            },
             "user": {
                 "id": 1,
-                "name": "Administrador Principal",
+                "name": "Paint",
                 "email": "paint@gmail.com",
-                "email_verified_at": "2026-01-01T00:00:00Z",
-                "roles": [{"id": 1, "name": "super-admin"}],
-                "can_manage_access": true,
-                "is_super_admin": true
+                "email_verified_at": "2026-01-01T00:00:00.000000Z",
+                "roles": ["super-admin"],
+                "permissions": ["manage.access"],
+                "created_at": "2026-01-01T00:00:00.000000Z",
+                "updated_at": "2026-01-01T00:00:00.000000Z"
             }
         }"#;
         let transport = MockTransport::with_status(200, body);
 
         let result = login_with_transport(
             &transport,
-            "http://localhost:8000/api/login",
+            "http://localhost:8000/api/auth/login",
             "  paint@gmail.com  ",
             "123456789",
             "Caja principal",
@@ -489,7 +549,7 @@ mod tests {
 
         let req = transport.last_request();
         assert_eq!(req.method, "POST_JSON");
-        assert_eq!(req.url, "http://localhost:8000/api/login");
+        assert_eq!(req.url, "http://localhost:8000/api/auth/login");
         assert!(req.bearer_token.is_none());
         let sent_body = req.body.expect("json body");
         assert!(sent_body.contains("\"email\":\"paint@gmail.com\""));
@@ -497,9 +557,12 @@ mod tests {
 
         assert_eq!(result.token, "1|sanctum_test_token_abc");
         assert_eq!(result.token_type, "Bearer");
+        assert_eq!(result.dining_versions.unwrap().cash, Some(4));
         assert_eq!(result.user.id, 1);
-        assert!(result.user.is_super_admin);
-        assert!(result.user.can_manage_access);
+        assert_eq!(result.user.roles, vec!["super-admin".to_string()]);
+        assert_eq!(result.user.permissions, vec!["manage.access".to_string()]);
+        assert!(result.user.is_super_admin());
+        assert!(result.user.can_manage_access());
     }
 
     #[test]
@@ -508,7 +571,7 @@ mod tests {
         assert_eq!(
             login_with_transport(
                 &dummy,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "",
                 "secret",
                 "Caja"
@@ -518,7 +581,7 @@ mod tests {
         assert_eq!(
             login_with_transport(
                 &dummy,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "user@dylan.pe",
                 "",
                 "Caja"
@@ -529,18 +592,18 @@ mod tests {
 
         let t422 = MockTransport::with_status(
             422,
-            r#"{"message":"The given data was invalid.","errors":{"email":["Las credenciales proporcionadas son incorrectas."]}}"#,
+            r#"{"message":"The given data was invalid.","errors":{"email":["Las credenciales proporcionadas no coinciden con nuestros registros."]}}"#,
         );
         assert_eq!(
             login_with_transport(
                 &t422,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "paint@gmail.com",
                 "mal",
                 "Caja"
             ),
             Err(ApiError::InvalidCredentials(
-                "Las credenciales proporcionadas son incorrectas.".to_string()
+                "Las credenciales proporcionadas no coinciden con nuestros registros.".to_string()
             ))
         );
 
@@ -548,7 +611,7 @@ mod tests {
         assert_eq!(
             login_with_transport(
                 &t401,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "paint@gmail.com",
                 "mal",
                 "Caja"
@@ -562,7 +625,7 @@ mod tests {
         assert_eq!(
             login_with_transport(
                 &t403,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "client@dylan.pe",
                 "123456789",
                 "Caja"
@@ -574,7 +637,7 @@ mod tests {
         assert!(matches!(
             login_with_transport(
                 &t429,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "paint@gmail.com",
                 "123",
                 "Caja"
@@ -586,7 +649,7 @@ mod tests {
         assert!(matches!(
             login_with_transport(
                 &t_net,
-                "http://localhost:8000/api/login",
+                "http://localhost:8000/api/auth/login",
                 "paint@gmail.com",
                 "123456789",
                 "Caja"
@@ -602,26 +665,30 @@ mod tests {
                 "id": 7,
                 "name": "Operador Caja",
                 "email": "caja@dylan.pe",
-                "roles": [{"id": 2, "name": "admin"}],
-                "can_manage_access": false,
-                "is_super_admin": false
+                "email_verified_at": "2026-01-01T00:00:00.000000Z",
+                "roles": ["admin"],
+                "permissions": ["manage.access"]
             }
         }"#;
         let t_ok = MockTransport::with_status(200, ok_body);
         let user =
-            fetch_me_with_transport(&t_ok, "http://localhost:8000/api/user", "7|valid_token")
-                .expect("valid /api/user");
+            fetch_me_with_transport(&t_ok, "http://localhost:8000/api/auth/me", "7|valid_token")
+                .expect("valid /api/auth/me");
         let req_ok = t_ok.last_request();
         assert_eq!(req_ok.method, "GET");
-        assert_eq!(req_ok.url, "http://localhost:8000/api/user");
+        assert_eq!(req_ok.url, "http://localhost:8000/api/auth/me");
         assert_eq!(req_ok.bearer_token.as_deref(), Some("7|valid_token"));
         assert_eq!(user.email, "caja@dylan.pe");
+        assert_eq!(user.roles, vec!["admin".to_string()]);
         assert!(map_permissions(&user).cash);
 
         let t_401 = MockTransport::with_status(401, r#"{"message":"Unauthenticated."}"#);
-        let err =
-            fetch_me_with_transport(&t_401, "http://localhost:8000/api/user", "7|revoked_token")
-                .unwrap_err();
+        let err = fetch_me_with_transport(
+            &t_401,
+            "http://localhost:8000/api/auth/me",
+            "7|revoked_token",
+        )
+        .unwrap_err();
         assert!(err.is_unauthorized());
     }
 
@@ -631,19 +698,19 @@ mod tests {
             MockTransport::with_status(200, r#"{"message":"Sesión cerrada correctamente."}"#);
         logout_with_transport(
             &t_ok,
-            "http://localhost:8000/api/logout",
+            "http://localhost:8000/api/auth/logout",
             "1|token_to_revoke",
         )
         .expect("logout 200");
         let req = t_ok.last_request();
         assert_eq!(req.method, "POST_EMPTY");
-        assert_eq!(req.url, "http://localhost:8000/api/logout");
+        assert_eq!(req.url, "http://localhost:8000/api/auth/logout");
         assert_eq!(req.bearer_token.as_deref(), Some("1|token_to_revoke"));
 
         let t_401 = MockTransport::with_status(401, r#"{"message":"Unauthenticated."}"#);
         logout_with_transport(
             &t_401,
-            "http://localhost:8000/api/logout",
+            "http://localhost:8000/api/auth/logout",
             "1|already_revoked",
         )
         .expect("logout 401 should be treated as signed out");

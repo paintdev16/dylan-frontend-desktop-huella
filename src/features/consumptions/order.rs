@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::state::store::{BREAKFAST_PRICE_CENTS, LUNCH_PRICE_CENTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,7 @@ impl Meal {
         }
     }
 
+    #[cfg(test)]
     pub const fn economic_price(self) -> i64 {
         match self {
             Self::Breakfast => BREAKFAST_PRICE_CENTS,
@@ -45,6 +47,7 @@ impl Menu {
         }
     }
 
+    #[cfg(test)]
     pub const fn unit_cents(self, meal: Meal) -> i64 {
         match self {
             Self::Economic => meal.economic_price(),

@@ -3,63 +3,33 @@ pub mod confirm_attendance;
 pub(crate) mod order;
 
 use gpui_kit::{
-    component::{IconName, StyledExt as _, h_flex, label::Label, v_flex},
+    component::{StyledExt as _, h_flex, label::Label, v_flex},
     prelude::FluentBuilder as _,
     *,
 };
 
 use crate::{
     components::{
-        button::AppButton,
-        metric_card::MetricCard,
+        loading,
         status_badge::{StatusBadge, StatusTone},
     },
-    features::pensioners::{SelectedPensioner, model::format_soles},
-    state::{
-        session::{AppRoute, SessionState},
-        store::ComedorStore,
-    },
-    theme::{ActiveDylanTheme as _, MetricAccent, Radii, Spacing, Typography},
+    features::pensioners::model::format_soles,
+    state::store::{ComedorStore, DataLoad},
+    theme::{ActiveDylanTheme as _, Radii, Spacing, Typography},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsumptionsEvent {
-    OpenIdentification,
-    OpenPensioners,
-    OpenCash,
-}
-
-/// Módulo de **Consumos** (Etapa 3): muestra el historial de atenciones confirmadas,
-/// métricas consolidadas y el saldo del pensionista seleccionado.
+/// Módulo de **Consumos** (Etapa 3): muestra el historial detallado de atenciones confirmadas.
 pub struct ConsumptionsView {
     store: Entity<ComedorStore>,
-    session: Entity<SessionState>,
-    selected: Option<SelectedPensioner>,
-    _subscriptions: [Subscription; 2],
+    _subscription: Subscription,
 }
 
-impl EventEmitter<ConsumptionsEvent> for ConsumptionsView {}
-
 impl ConsumptionsView {
-    pub fn new(
-        store: Entity<ComedorStore>,
-        session: Entity<SessionState>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(store: Entity<ComedorStore>, cx: &mut Context<Self>) -> Self {
         let observe_store = cx.observe(&store, |_, _, cx| cx.notify());
-        let observe_session = cx.observe(&session, |_, _, cx| cx.notify());
         Self {
             store,
-            session,
-            selected: None,
-            _subscriptions: [observe_store, observe_session],
-        }
-    }
-
-    pub fn set_selected(&mut self, selected: Option<SelectedPensioner>, cx: &mut Context<Self>) {
-        if self.selected != selected {
-            self.selected = selected;
-            cx.notify();
+            _subscription: observe_store,
         }
     }
 }
@@ -71,29 +41,9 @@ impl Render for ConsumptionsView {
         let outer_padding = if compact { Spacing::MD } else { Spacing::XL };
         let card_padding = if compact { Spacing::MD } else { Spacing::LG };
 
-        let (can_open_cash, can_open_id, can_open_pensioners) = {
-            let session = self.session.read(cx);
-            (
-                session.can_access_route(AppRoute::Cash),
-                session.can_access_route(AppRoute::Identification),
-                session.can_access_route(AppRoute::Pensioners),
-            )
-        };
-
         let store = self.store.read(cx);
-        let ledger = store.ledger();
-        let cash_open = ledger.is_cash_open();
-        let total_breakfasts = ledger.total_breakfasts();
-        let total_lunches = ledger.total_lunches();
-        let total_tickets = ledger.total_tickets_received();
-        let total_ticket_amount = ledger.total_ticket_amount_cents();
-        let attendances: Vec<_> = ledger.attendances().iter().rev().cloned().collect();
-        let selected_pensioner = self.selected.and_then(|sel| {
-            ledger
-                .find_pensioner(sel.id)
-                .cloned()
-                .map(|p| (p, sel.source))
-        });
+        let load = store.attendances_load();
+        let attendances: Vec<_> = store.ledger().attendances().iter().rev().cloned().collect();
 
         v_flex()
             .id("consumptions-scroll")
@@ -110,160 +60,32 @@ impl Render for ConsumptionsView {
                     .max_w(px(1080.0))
                     .gap(if compact { Spacing::MD } else { Spacing::LG })
                     .child(
-                        h_flex()
+                        v_flex()
                             .w_full()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_between()
-                            .gap(Spacing::MD)
+                            .gap(Spacing::XXS)
                             .p(card_padding)
                             .rounded(Radii::LG)
                             .bg(palette.surface)
                             .border_1()
                             .border_color(palette.border)
                             .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .gap(Spacing::XXS)
-                                    .child(
-                                        Label::new("Consumos y atenciones")
-                                            .text_size(if compact {
-                                                Typography::XL
-                                            } else {
-                                                Typography::PAGE_TITLE
-                                            })
-                                            .font_bold()
-                                            .text_color(palette.foreground),
-                                    )
-                                    .child(
-                                        Label::new(
-                                            "Atenciones confirmadas desde Buscar pensionista (Ctrl+K) o Identificación.",
-                                        )
-                                        .text_size(Typography::SM)
-                                        .text_color(palette.muted_foreground),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(Spacing::SM)
-                                    .child(if cash_open {
-                                        StatusBadge::new(StatusTone::Success, "Caja abierta")
+                                Label::new("Consumos y atenciones")
+                                    .text_size(if compact {
+                                        Typography::XL
                                     } else {
-                                        StatusBadge::new(StatusTone::Warning, "Caja cerrada")
+                                        Typography::PAGE_TITLE
                                     })
-                                    .when(can_open_cash && !cash_open, |this| {
-                                        this.child(
-                                            AppButton::new("consumptions-open-cash")
-                                                .secondary()
-                                                .small()
-                                                .icon(IconName::Inbox)
-                                                .label("Abrir caja")
-                                                .on_click(cx.listener(|_, _, _, cx| {
-                                                    cx.emit(ConsumptionsEvent::OpenCash);
-                                                })),
-                                        )
-                                    }),
+                                    .font_bold()
+                                    .text_color(palette.foreground),
+                            )
+                            .child(
+                                Label::new(
+                                    "Atenciones confirmadas desde Buscar pensionista (Ctrl+K) o Identificación.",
+                                )
+                                .text_size(Typography::SM)
+                                .text_color(palette.muted_foreground),
                             ),
                     )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .flex_wrap()
-                            .gap(Spacing::MD)
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Breakfasts,
-                                    "Desayunos",
-                                    total_breakfasts.to_string(),
-                                )
-                                .icon(IconName::Sun)
-                                .subtitle("Confirmados hoy"),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Lunches,
-                                    "Almuerzos",
-                                    total_lunches.to_string(),
-                                )
-                                .icon(IconName::Calendar)
-                                .subtitle("Confirmados hoy"),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::TicketsReceived,
-                                    "Tickets recibidos",
-                                    total_tickets.to_string(),
-                                )
-                                .icon(IconName::Info)
-                                .subtitle(format!(
-                                    "Abono {}",
-                                    format_soles(total_ticket_amount)
-                                )),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Neutral,
-                                    "Atenciones",
-                                    attendances.len().to_string(),
-                                )
-                                .icon(IconName::FileText)
-                                .subtitle(format!(
-                                    "{} raciones totales",
-                                    total_breakfasts + total_lunches
-                                )),
-                            ),
-                    )
-                    .when_some(selected_pensioner, |this, (pensioner, source)| {
-                        this.child(
-                            h_flex()
-                                .w_full()
-                                .flex_wrap()
-                                .items_center()
-                                .justify_between()
-                                .gap(Spacing::MD)
-                                .p(card_padding)
-                                .rounded(Radii::LG)
-                                .bg(palette.surface)
-                                .border_1()
-                                .border_color(palette.border)
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .gap(Spacing::XXS)
-                                        .child(
-                                            h_flex()
-                                                .flex_wrap()
-                                                .items_center()
-                                                .gap(Spacing::SM)
-                                                .child(
-                                                    Label::new(format!(
-                                                        "Seleccionado: {} ({})",
-                                                        pensioner.full_name,
-                                                        pensioner.code()
-                                                    ))
-                                                    .text_size(Typography::BASE)
-                                                    .font_semibold()
-                                                    .text_color(palette.foreground),
-                                                )
-                                                .child(StatusBadge::new(
-                                                    StatusTone::Neutral,
-                                                    source.label(),
-                                                )),
-                                        )
-                                        .child(
-                                            Label::new(format!(
-                                                "Saldo individual: {} · Tickets registrados: {}",
-                                                format_soles(pensioner.balance_cents),
-                                                pensioner.tickets_balance
-                                            ))
-                                            .text_size(Typography::XS)
-                                            .text_color(palette.muted_foreground),
-                                        ),
-                                ),
-                        )
-                    })
                     .child(
                         v_flex()
                             .w_full()
@@ -286,41 +108,24 @@ impl Render for ConsumptionsView {
                                             .font_semibold()
                                             .text_color(palette.foreground),
                                     )
-                                    .child(
-                                        h_flex()
-                                            .flex_wrap()
-                                            .gap(Spacing::XS)
-                                            .when(can_open_id, |bar| {
-                                                bar.child(
-                                                    AppButton::new("consumptions-go-id")
-                                                        .tertiary()
-                                                        .small()
-                                                        .icon(IconName::Search)
-                                                        .label("Ir a Identificación")
-                                                        .on_click(cx.listener(|_, _, _, cx| {
-                                                            cx.emit(
-                                                                ConsumptionsEvent::OpenIdentification,
-                                                            );
-                                                        })),
-                                                )
-                                            })
-                                            .when(can_open_pensioners, |bar| {
-                                                bar.child(
-                                                    AppButton::new("consumptions-go-pensioners")
-                                                        .tertiary()
-                                                        .small()
-                                                        .icon(IconName::User)
-                                                        .label("Ver Pensionistas")
-                                                        .on_click(cx.listener(|_, _, _, cx| {
-                                                            cx.emit(
-                                                                ConsumptionsEvent::OpenPensioners,
-                                                            );
-                                                        })),
-                                                )
-                                            }),
-                                    ),
+                                    .when(load == DataLoad::Ready, |header| header.child(
+                                        Label::new(format!("{} registros", attendances.len()))
+                                            .text_size(Typography::XS)
+                                            .text_color(palette.muted_foreground),
+                                    ))
+                                    .when(load == DataLoad::Loading, |header| {
+                                        header.child(loading::line("attendance-count-loading", px(66.)))
+                                    }),
                             )
-                            .child(if attendances.is_empty() {
+                            .child(if load == DataLoad::Loading {
+                                loading::rows("consumption-history-loading", "Cargando atenciones", 4, cx)
+                                    .into_any_element()
+                            } else if load == DataLoad::Failed {
+                                Label::new("No se pudo cargar el historial de atenciones.")
+                                    .text_size(Typography::SM)
+                                    .text_color(palette.muted_foreground)
+                                    .into_any_element()
+                            } else if attendances.is_empty() {
                                 v_flex()
                                     .w_full()
                                     .items_center()
@@ -415,59 +220,36 @@ impl Render for ConsumptionsView {
                                                     .items_center()
                                                     .justify_between()
                                                     .gap(Spacing::SM)
-                                                    .child(
-                                                        Label::new(if record.tickets_count > 0 {
-                                                            let mov_suffix = record
-                                                                .movement_code
-                                                                .as_deref()
-                                                                .map(|code| format!(" · {code}"))
-                                                                .unwrap_or_default();
-                                                            format!(
-                                                                "Desayunos: {} · Almuerzos: {} ({}) · Tickets: {} × {} ({}{mov_suffix})",
-                                                                record.breakfasts,
-                                                                record.lunches,
-                                                                format_soles(record.consumption_cents),
-                                                                record.tickets_count,
-                                                                format_soles(record.ticket_unit_cents),
-                                                                format_soles(record.ticket_amount_cents),
-                                                            )
-                                                        } else {
-                                                            format!(
-                                                                "Desayunos: {} · Almuerzos: {} ({}) · Tickets: 0",
-                                                                record.breakfasts,
-                                                                record.lunches,
-                                                                format_soles(record.consumption_cents),
-                                                            )
-                                                        })
-                                                        .text_size(Typography::SM)
-                                                        .text_color(palette.foreground),
-                                                    )
-                                                    .child(
-                                                        Label::new(format!(
-                                                            "Saldo: {} → {}",
-                                                            format_soles(
-                                                                record.balance_before_cents
-                                                            ),
-                                                            format_soles(record.balance_after_cents)
-                                                        ))
-                                                        .text_size(Typography::XS)
-                                                        .font_semibold()
-                                                        .text_color(
-                                                            if record.balance_after_cents < 0 {
+                                                    .when(record.has_consumptions, |row| row.child(
+                                                        Label::new(format!("Desayunos {} · Almuerzos {} · {}", record.breakfasts, record.lunches, format_soles(record.consumption_cents)))
+                                                            .text_size(Typography::SM)
+                                                            .text_color(palette.foreground)
+                                                    ))
+                                                    .when(record.has_payments, |row| row.child(
+                                                        Label::new(format!("Tickets {} × {} · {}{}", record.tickets_count,
+                                                            format_soles(record.ticket_unit_cents), format_soles(record.ticket_amount_cents),
+                                                            record.movement_code.as_ref().map_or_else(String::new, |code| format!(" · {code}"))))
+                                                            .text_size(Typography::SM)
+                                                            .text_color(palette.foreground)
+                                                    ))
+                                                    .when(record.has_balance, |row| row.child(
+                                                        Label::new(format!("Saldo {} → {}", format_soles(record.balance_before_cents), format_soles(record.balance_after_cents)))
+                                                            .text_size(Typography::XS)
+                                                            .font_semibold()
+                                                            .text_color(if record.balance_after_cents < 0 {
                                                                 palette.error.foreground
                                                             } else {
                                                                 palette.success.foreground
-                                                            },
-                                                        ),
-                                                    ),
+                                                            }),
+                                                    )),
                                             )
-                                            .children(record.items.iter().map(|item| {
+                                            .children(record.items.iter().zip(&record.item_prices).map(|(item, price)| {
                                                 Label::new(format!(
                                                     "{} · {} · {} × {}",
                                                     item.meal.label(),
                                                     item.menu.label(),
                                                     item.portions,
-                                                    format_soles(item.menu.unit_cents(item.meal)),
+                                                    format_soles(*price),
                                                 ))
                                                 .text_size(Typography::XS)
                                                 .text_color(palette.muted_foreground)

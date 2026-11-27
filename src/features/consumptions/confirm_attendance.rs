@@ -1,7 +1,7 @@
-use crate::{
-    features::pensioners::{SelectionSource, model::PensionerId},
-    state::store::{AttendanceRecord, DemoLedger},
-};
+use crate::features::pensioners::{SelectionSource, model::PensionerId};
+
+#[cfg(test)]
+use crate::state::store::{AttendanceRecord, DemoLedger};
 
 use super::order::{ConsumptionItem, Meal};
 
@@ -13,7 +13,9 @@ pub struct AttendanceRequest {
     pub picked_up_by: Option<String>,
     pub tickets_count: u32,
     pub source: SelectionSource,
+    #[cfg(test)]
     pub operator_name: String,
+    #[cfg(test)]
     pub can_register_attendance: bool,
 }
 
@@ -28,17 +30,37 @@ pub struct AttendanceSummary {
 }
 
 impl AttendanceSummary {
+    #[cfg(test)]
     pub fn calculate(
         balance: i64,
         items: &[ConsumptionItem],
         tickets: u32,
         ticket_unit_cents: i64,
     ) -> Result<Self, AttendanceError> {
+        Self::calculate_with_prices(
+            balance,
+            items,
+            tickets,
+            ticket_unit_cents,
+            Meal::economic_price,
+        )
+    }
+
+    pub fn calculate_with_prices(
+        balance: i64,
+        items: &[ConsumptionItem],
+        tickets: u32,
+        ticket_unit_cents: i64,
+        economic_price: impl Fn(Meal) -> i64,
+    ) -> Result<Self, AttendanceError> {
         let mut breakfasts = 0u32;
         let mut lunches = 0u32;
         let mut consumption_cents = 0i64;
         for item in items {
-            let unit = item.menu.unit_cents(item.meal);
+            let unit = match item.menu {
+                super::order::Menu::Economic => economic_price(item.meal),
+                super::order::Menu::Special { unit_cents } => unit_cents,
+            };
             if item.portions == 0 || unit <= 0 {
                 return Err(AttendanceError::InvalidItem);
             }
@@ -86,14 +108,22 @@ impl AttendanceSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttendanceError {
+    #[cfg(test)]
     Unauthorized,
+    #[cfg(test)]
     PensionerNotFound(PensionerId),
+    #[cfg(test)]
     InactivePensioner,
+    #[cfg(test)]
     EmptyOperation,
+    #[cfg(test)]
     CashClosed,
+    #[cfg(test)]
     DuplicateConfirmation,
+    #[cfg(test)]
     InvalidIdempotencyKey,
     InvalidItem,
+    #[cfg(test)]
     InvalidPickup,
     InvalidTicketValue,
     AmountOverflow,
@@ -102,14 +132,22 @@ pub enum AttendanceError {
 impl AttendanceError {
     pub const fn message(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Unauthorized => "Tu sesión no tiene permiso para registrar atenciones.",
+            #[cfg(test)]
             Self::PensionerNotFound(_) => "No se encontró el pensionista.",
+            #[cfg(test)]
             Self::InactivePensioner => "El pensionista está inactivo.",
+            #[cfg(test)]
             Self::EmptyOperation => "Agrega al menos un consumo o un ticket físico.",
+            #[cfg(test)]
             Self::CashClosed => "Abre la caja para recibir tickets o deja la cantidad en cero.",
+            #[cfg(test)]
             Self::DuplicateConfirmation => "Esta atención ya fue confirmada.",
+            #[cfg(test)]
             Self::InvalidIdempotencyKey => "No se pudo validar la clave de confirmación.",
             Self::InvalidItem => "Cada consumo debe tener raciones y un precio mayor a cero.",
+            #[cfg(test)]
             Self::InvalidPickup => "Ingresa el nombre de quien recoge el consumo.",
             Self::InvalidTicketValue => "El valor configurado del ticket debe ser mayor a S/ 0.00.",
             Self::AmountOverflow => "El importe o la cantidad excede el límite permitido.",
@@ -117,6 +155,7 @@ impl AttendanceError {
     }
 }
 
+#[cfg(test)]
 pub fn confirm_attendance(
     ledger: &mut DemoLedger,
     mut request: AttendanceRequest,

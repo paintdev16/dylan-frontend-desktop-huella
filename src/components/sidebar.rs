@@ -1,8 +1,8 @@
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use gpui_kit::{
     component::{
-        ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, StyledExt as _,
+        ActiveTheme as _, Icon, Placement, Selectable as _, Sizable as _, StyledExt as _,
         button::{Button, ButtonCustomVariant, ButtonVariants as _},
         h_flex,
         label::Label,
@@ -13,16 +13,13 @@ use gpui_kit::{
 };
 
 use crate::{
-    components::status_badge::{StatusBadge, StatusTone},
-    state::{
-        reader::ReaderStatus,
-        session::{AppRoute, RouteGroup},
-    },
+    state::session::{AppRoute, RouteGroup},
     theme::{ActiveDylanTheme as _, Radii, Spacing, Typography},
 };
 
 pub const SIDEBAR_EXPANDED_WIDTH: Pixels = px(236.0);
 pub const SIDEBAR_COLLAPSED_WIDTH: Pixels = px(64.0);
+const COLLAPSED_TOOLTIP_DELAY: Duration = Duration::from_millis(120);
 
 type SelectRouteHandler = Rc<dyn Fn(AppRoute, &mut Window, &mut App)>;
 
@@ -50,8 +47,6 @@ pub struct AppSidebar {
     routes: Vec<AppRoute>,
     active_route: AppRoute,
     collapsed: bool,
-    reader_status: ReaderStatus,
-    selected_label: Option<SharedString>,
     on_select: SelectRouteHandler,
 }
 
@@ -60,22 +55,14 @@ impl AppSidebar {
         routes: Vec<AppRoute>,
         active_route: AppRoute,
         collapsed: bool,
-        reader_status: ReaderStatus,
         on_select: impl Fn(AppRoute, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
             routes,
             active_route,
             collapsed,
-            reader_status,
-            selected_label: None,
             on_select: Rc::new(on_select),
         }
-    }
-
-    pub fn selected_label(mut self, label: Option<SharedString>) -> Self {
-        self.selected_label = label;
-        self
     }
 }
 
@@ -86,23 +73,6 @@ impl RenderOnce for AppSidebar {
         let palette = cx.dylan_theme().palette;
         let groups = grouped_routes(&self.routes);
         let collapsed = self.collapsed;
-
-        let reader_tone = match self.reader_status {
-            ReaderStatus::Disconnected { .. } => StatusTone::Error,
-            ReaderStatus::Ready | ReaderStatus::Matched { .. } | ReaderStatus::Enrolled { .. } => {
-                StatusTone::Success
-            }
-            ReaderStatus::Capturing { .. } => StatusTone::Info,
-            ReaderStatus::Unrecognized | ReaderStatus::EnrollmentMismatch => StatusTone::Warning,
-            ReaderStatus::Cancelled => StatusTone::Neutral,
-        };
-        let reader_dot_color = match reader_tone {
-            StatusTone::Success => palette.success.icon,
-            StatusTone::Warning => palette.warning.icon,
-            StatusTone::Error => palette.error.icon,
-            StatusTone::Info => palette.info.icon,
-            StatusTone::Neutral => palette.neutral.icon,
-        };
 
         let nav_sections = v_flex()
             .id("sidebar-nav-scroll")
@@ -122,6 +92,7 @@ impl RenderOnce for AppSidebar {
                         v_flex()
                             .w_full()
                             .gap(Spacing::XS)
+                            .when(collapsed, |this| this.items_center())
                             .when(collapsed && index > 0, |this| {
                                 this.pt(Spacing::XS)
                                     .border_t_1()
@@ -146,7 +117,11 @@ impl RenderOnce for AppSidebar {
                                     .rounded(Radii::MD)
                                     .selected(is_active)
                                     .accessibility_label(label)
-                                    .when(collapsed, |this| this.tooltip(label))
+                                    .when(collapsed, |this| {
+                                        this.tooltip(label)
+                                            .tooltip_placement(Placement::Right)
+                                            .tooltip_show_delay(COLLAPSED_TOOLTIP_DELAY)
+                                    })
                                     .on_click(move |_, window, cx| on_select(route, window, cx));
 
                                 if is_active {
@@ -206,84 +181,6 @@ impl RenderOnce for AppSidebar {
                     }),
             );
 
-        let on_select_pensioners = self.on_select.clone();
-        let can_open_pensioners = self.routes.contains(&AppRoute::Pensioners);
-
-        let footer = v_flex()
-            .w_full()
-            .flex_shrink_0()
-            .p(Spacing::SM)
-            .gap(Spacing::SM)
-            .border_t_1()
-            .border_color(gpui_theme.sidebar_border)
-            .when(!collapsed, |this| {
-                this.when_some(self.selected_label.clone(), |panel, chip| {
-                    panel.child(
-                        Button::new("sidebar-selected-pensioner")
-                            .ghost()
-                            .w_full()
-                            .rounded(Radii::MD)
-                            .bg(palette.neutral.tint)
-                            .border_1()
-                            .border_color(palette.neutral.border)
-                            .tooltip("Ver ficha del pensionista seleccionado")
-                            .when(can_open_pensioners, |button| {
-                                let on_select = on_select_pensioners.clone();
-                                button.on_click(move |_, window, cx| {
-                                    on_select(AppRoute::Pensioners, window, cx);
-                                })
-                            })
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .items_center()
-                                    .gap(Spacing::XS)
-                                    .child(
-                                        Icon::new(IconName::Check)
-                                            .xsmall()
-                                            .text_color(palette.neutral.icon),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .child(
-                                                Label::new(chip)
-                                                    .text_size(Typography::XS)
-                                                    .font_medium()
-                                                    .text_color(palette.neutral.foreground),
-                                            ),
-                                    ),
-                            ),
-                    )
-                })
-                .child(
-                    h_flex().w_full().child(
-                        StatusBadge::new(reader_tone, self.reader_status.short_label())
-                            .loading(self.reader_status.is_capturing()),
-                    ),
-                )
-            })
-            .when(collapsed, |this| {
-                this.items_center().child(
-                    Button::new("sidebar-reader-status-dot")
-                        .ghost()
-                        .xsmall()
-                        .accessibility_label(self.reader_status.short_label())
-                        .tooltip(self.reader_status.short_label())
-                        .child(
-                            div()
-                                .size(px(10.0))
-                                .rounded(Radii::FULL)
-                                .bg(reader_dot_color),
-                        ),
-                )
-            });
-
         v_flex()
             .id("app-sidebar")
             .w(if collapsed {
@@ -297,7 +194,6 @@ impl RenderOnce for AppSidebar {
             .border_r_1()
             .border_color(gpui_theme.sidebar_border)
             .child(nav_sections)
-            .child(footer)
     }
 }
 

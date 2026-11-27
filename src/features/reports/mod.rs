@@ -1,8 +1,14 @@
+mod daily;
+
+use chrono::{Datelike as _, NaiveDate, Weekday};
 use gpui_kit::{
     component::{
-        IconName, Sizable as _, StyledExt as _, h_flex,
-        input::{Input, InputEvent, InputState},
+        Icon, IconName, Sizable as _, StyledExt as _,
+        button::Button,
+        calendar::{Calendar, CalendarEvent, CalendarState, Date, Matcher},
+        h_flex,
         label::Label,
+        popover::Popover,
         v_flex,
     },
     prelude::FluentBuilder as _,
@@ -12,118 +18,245 @@ use gpui_kit::{
 use crate::{
     components::{
         button::AppButton,
-        metric_card::MetricCard,
         status_badge::{StatusBadge, StatusTone},
     },
-    features::pensioners::model::format_soles,
-    state::store::{CalendarDate, ComedorStore, DatePeriodFilter},
-    theme::{ActiveDylanTheme as _, MetricAccent, Radii, Spacing, Typography},
+    state::store::{CalendarDate, ComedorStore, DataLoad, DatePeriodFilter},
+    theme::{ActiveDylanTheme as _, Radii, Spacing, Typography},
 };
 
-/// Módulo de **Reportes** (Etapa 4): consulta los mismos registros confirmados que
-/// Consumos, Caja y Dashboard con filtros por fecha (preajustes y rango personalizado).
+fn to_naive_date(date: CalendarDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(date.year, u32::from(date.month), u32::from(date.day))
+        .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid fallback date"))
+}
+
+fn from_naive_date(date: NaiveDate) -> CalendarDate {
+    CalendarDate {
+        year: date.year(),
+        month: date.month() as u8,
+        day: date.day() as u8,
+    }
+}
+
+fn normalize_range(from: CalendarDate, to: CalendarDate) -> (CalendarDate, CalendarDate) {
+    if from > to { (from, from) } else { (from, to) }
+}
+
+/// Actividad diaria para el rango de fechas elegido.
 pub struct ReportsView {
     store: Entity<ComedorStore>,
     period: DatePeriodFilter,
-    from_input: Entity<InputState>,
-    to_input: Entity<InputState>,
-    filter_error: Option<SharedString>,
+    from_date: CalendarDate,
+    to_date: CalendarDate,
+    from_calendar: Entity<CalendarState>,
+    to_calendar: Entity<CalendarState>,
+    from_open: bool,
+    to_open: bool,
+    daily_offset: i64,
     _subscriptions: [Subscription; 3],
 }
 
 impl ReportsView {
     pub fn new(store: Entity<ComedorStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let today = store.read(cx).ledger().current_date().format_iso();
-        let from_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("YYYY-MM-DD")
-                .default_value(today.clone())
+        let today = store.read(cx).ledger().current_date();
+        let today_naive = to_naive_date(today);
+
+        let from_calendar = cx.new(|cx| {
+            let mut calendar = CalendarState::new(window, cx);
+            calendar.set_date(Date::Single(Some(today_naive)), window, cx);
+            calendar
         });
-        let to_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("YYYY-MM-DD")
-                .default_value(today)
+        let to_calendar = cx.new(|cx| {
+            let mut calendar = CalendarState::new(window, cx)
+                .disabled_matcher(Matcher::custom(move |d| *d < today_naive));
+            calendar.set_date(Date::Single(Some(today_naive)), window, cx);
+            calendar
         });
 
         let observe_store = cx.observe(&store, |_, _, cx| cx.notify());
-        let sub_from = cx.subscribe(&from_input, |view, _, event, cx| {
-            if matches!(event, InputEvent::Change) && view.filter_error.is_some() {
-                view.filter_error = None;
-                cx.notify();
-            }
-        });
-        let sub_to = cx.subscribe(&to_input, |view, _, event, cx| {
-            if matches!(event, InputEvent::Change) && view.filter_error.is_some() {
-                view.filter_error = None;
-                cx.notify();
+        let sub_from = cx.subscribe_in(
+            &from_calendar,
+            window,
+            |view, _, event: &CalendarEvent, window, cx| {
+                let CalendarEvent::Selected(date) = event;
+                if let Some(selected) = date.start() {
+                    view.on_from_selected(selected, window, cx);
+                }
+            },
+        );
+        let sub_to = cx.subscribe(&to_calendar, |view, _, event: &CalendarEvent, cx| {
+            let CalendarEvent::Selected(date) = event;
+            if let Some(selected) = date.start() {
+                view.on_to_selected(selected, cx);
             }
         });
 
         Self {
             store,
             period: DatePeriodFilter::Today,
-            from_input,
-            to_input,
-            filter_error: None,
+            from_date: today,
+            to_date: today,
+            from_calendar,
+            to_calendar,
+            from_open: false,
+            to_open: false,
+            daily_offset: 0,
             _subscriptions: [observe_store, sub_from, sub_to],
         }
     }
 
-    fn apply_preset(
-        &mut self,
-        preset: DatePeriodFilter,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.period = preset;
-        self.filter_error = None;
-        let today = self.store.read(cx).ledger().current_date();
-        let (from, to) = match preset {
-            DatePeriodFilter::Today => (today, today),
-            DatePeriodFilter::Last7Days => (today.sub_days(6), today),
-            DatePeriodFilter::ThisMonth => (
-                CalendarDate::new(today.year, today.month, 1).unwrap_or(today),
-                today,
-            ),
-            DatePeriodFilter::All => (today.sub_days(30), today),
-            DatePeriodFilter::Custom { from, to } => (from, to),
-        };
-        self.from_input.update(cx, |input, cx| {
-            input.set_value(from.format_iso(), window, cx)
-        });
-        self.to_input
-            .update(cx, |input, cx| input.set_value(to.format_iso(), window, cx));
+    fn set_popover_open(&mut self, is_from: bool, open: bool, cx: &mut Context<Self>) {
+        if is_from {
+            self.from_open = open;
+            if open {
+                self.to_open = false;
+            }
+        } else {
+            self.to_open = open;
+            if open {
+                self.from_open = false;
+            }
+        }
         cx.notify();
     }
 
-    fn apply_custom_range(&mut self, cx: &mut Context<Self>) {
-        let from_raw = self.from_input.read(cx).value();
-        let to_raw = self.to_input.read(cx).value();
-        let Some(from) = CalendarDate::parse_iso(from_raw.as_ref()) else {
-            self.filter_error = Some(SharedString::from(
-                "Fecha 'Desde' inválida. Usa el formato YYYY-MM-DD.",
-            ));
-            cx.notify();
-            return;
-        };
-        let Some(to) = CalendarDate::parse_iso(to_raw.as_ref()) else {
-            self.filter_error = Some(SharedString::from(
-                "Fecha 'Hasta' inválida. Usa el formato YYYY-MM-DD.",
-            ));
-            cx.notify();
-            return;
-        };
-        if from > to {
-            self.filter_error = Some(SharedString::from(
-                "La fecha 'Desde' no puede ser posterior a 'Hasta'.",
-            ));
-            cx.notify();
-            return;
-        }
+    fn on_from_selected(&mut self, naive: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        let (from, to) = normalize_range(from_naive_date(naive), self.to_date);
+        self.from_date = from;
+        self.to_date = to;
+        self.from_open = false;
 
-        self.filter_error = None;
-        self.period = DatePeriodFilter::Custom { from, to };
+        let min_to = to_naive_date(self.from_date);
+        let current_to = to_naive_date(self.to_date);
+        self.to_calendar.update(cx, |calendar, cx| {
+            calendar.set_disabled_matcher(Matcher::custom(move |d| *d < min_to), window, cx);
+            calendar.set_date(Date::Single(Some(current_to)), window, cx);
+        });
+        self.sync_period(cx);
+    }
+
+    fn on_to_selected(&mut self, naive: NaiveDate, cx: &mut Context<Self>) {
+        let picked = from_naive_date(naive);
+        self.to_date = picked.max(self.from_date);
+        self.to_open = false;
+        self.sync_period(cx);
+    }
+
+    fn sync_period(&mut self, cx: &mut Context<Self>) {
+        self.daily_offset = 0;
+        let today = self.store.read(cx).ledger().current_date();
+        self.period = if self.from_date == today && self.to_date == today {
+            DatePeriodFilter::Today
+        } else {
+            DatePeriodFilter::Custom {
+                from: self.from_date,
+                to: self.to_date,
+            }
+        };
+        self.load_daily(false, cx);
+    }
+
+    fn daily_page(&self) -> daily::DailyPage {
+        let (from, to) = if self.period == DatePeriodFilter::Today {
+            let today = CalendarDate::today();
+            (today, today)
+        } else {
+            (self.from_date, self.to_date)
+        };
+        daily::DailyPage::new(from, to, self.daily_offset)
+    }
+
+    pub fn load_daily(&self, force: bool, cx: &mut Context<Self>) {
+        let page = self.daily_page();
+        self.store.update(cx, |store, cx| {
+            store.load_daily_activity((page.from, page.to), force, cx);
+        });
         cx.notify();
+    }
+
+    fn select_recent_days(&mut self, days: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let today = self.store.read(cx).ledger().current_date();
+        let today_naive = to_naive_date(today);
+        self.from_date = today.sub_days(days - 1);
+        self.to_date = today;
+        self.from_open = false;
+        self.to_open = false;
+
+        let from_naive = to_naive_date(self.from_date);
+        self.from_calendar.update(cx, |calendar, cx| {
+            calendar.set_date(Date::Single(Some(from_naive)), window, cx);
+        });
+        self.to_calendar.update(cx, |calendar, cx| {
+            calendar.set_disabled_matcher(Matcher::custom(move |d| *d < from_naive), window, cx);
+            calendar.set_date(Date::Single(Some(today_naive)), window, cx);
+        });
+        self.sync_period(cx);
+    }
+
+    fn render_date_field(
+        &self,
+        label: &'static str,
+        popover_id: &'static str,
+        button_id: &'static str,
+        date: CalendarDate,
+        calendar: &Entity<CalendarState>,
+        is_open: bool,
+        is_from: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let palette = cx.dylan_theme().palette;
+        let trigger = Button::new(button_id)
+            .outline()
+            .small()
+            .w(px(172.0))
+            .rounded(Radii::MD)
+            .bg(palette.surface)
+            .border_color(if is_open {
+                palette.focus_ring
+            } else {
+                palette.input_border
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap(Spacing::XS)
+                    .child(
+                        Label::new(date.format_iso())
+                            .text_size(Typography::SM)
+                            .text_color(palette.foreground),
+                    )
+                    .child(
+                        Icon::new(IconName::Calendar)
+                            .xsmall()
+                            .text_color(palette.muted_foreground),
+                    ),
+            );
+
+        v_flex()
+            .gap(Spacing::XXS)
+            .child(
+                Label::new(label)
+                    .text_size(Typography::XS)
+                    .font_semibold()
+                    .text_color(palette.muted_foreground),
+            )
+            .child(
+                Popover::new(popover_id)
+                    .open(is_open)
+                    .on_open_change(cx.listener(move |view, open: &bool, _, cx| {
+                        view.set_popover_open(is_from, *open, cx);
+                    }))
+                    .trigger(trigger)
+                    .p(Spacing::XS)
+                    .child(
+                        Calendar::new(calendar)
+                            .small()
+                            .first_day_of_week(Weekday::Mon)
+                            .border_0()
+                            .p_0(),
+                    ),
+            )
     }
 }
 
@@ -134,11 +267,17 @@ impl Render for ReportsView {
         let outer_padding = if compact { Spacing::MD } else { Spacing::XL };
         let card_padding = if compact { Spacing::MD } else { Spacing::LG };
 
-        let report = self.store.read(cx).ledger().report_for_period(self.period);
+        let daily_page = self.daily_page();
+        let query = self
+            .store
+            .read(cx)
+            .daily_activity((daily_page.from, daily_page.to));
+        let is_loading = query.is_some_and(|query| query.status() == DataLoad::Loading);
+        let report_error = query.and_then(|query| query.error.clone());
+        let daily_charts = query
+            .and_then(|query| query.value.as_ref())
+            .map(|days| daily::charts(days, compact, cx));
         let period_label = self.period.label();
-        let attendances: Vec<_> = report.attendances.iter().rev().cloned().collect();
-        let movements: Vec<_> = report.ticket_movements.iter().rev().cloned().collect();
-        let by_pensioner = report.by_pensioner.clone();
 
         v_flex()
             .id("reports-scroll")
@@ -171,26 +310,14 @@ impl Render for ReportsView {
                                     .justify_between()
                                     .gap(Spacing::SM)
                                     .child(
-                                        v_flex()
-                                            .min_w_0()
-                                            .gap(Spacing::XXS)
-                                            .child(
-                                                Label::new("Reportes")
-                                                    .text_size(if compact {
-                                                        Typography::XL
-                                                    } else {
-                                                        Typography::PAGE_TITLE
-                                                    })
-                                                    .font_bold()
-                                                    .text_color(palette.foreground),
-                                            )
-                                            .child(
-                                                Label::new(
-                                                    "Consumos, raciones y abonos con tickets consultados desde la misma fuente que Consumos, Caja y Dashboard.",
-                                                )
-                                                .text_size(Typography::SM)
-                                                .text_color(palette.muted_foreground),
-                                            ),
+                                        Label::new("Reportes")
+                                            .text_size(if compact {
+                                                Typography::XL
+                                            } else {
+                                                Typography::PAGE_TITLE
+                                            })
+                                            .font_bold()
+                                            .text_color(palette.foreground),
                                     )
                                     .child(StatusBadge::new(
                                         StatusTone::Neutral,
@@ -201,75 +328,35 @@ impl Render for ReportsView {
                                 h_flex()
                                     .w_full()
                                     .flex_wrap()
-                                    .items_center()
-                                    .gap(Spacing::XS)
-                                    .children(DatePeriodFilter::PRESETS.into_iter().map(
-                                        |preset| {
-                                            let active = self.period == preset;
-                                            let btn = AppButton::new(SharedString::from(format!(
-                                                "report-period-{preset:?}"
-                                            )))
-                                            .small()
-                                            .label(preset.label())
-                                            .on_click(cx.listener(move |view, _, window, cx| {
-                                                view.apply_preset(preset, window, cx);
-                                            }));
-                                            if active {
-                                                btn.primary()
-                                            } else {
-                                                btn.secondary()
-                                            }
-                                        },
-                                    )),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .flex_wrap()
                                     .items_end()
                                     .gap(Spacing::SM)
+                                    .child(self.render_date_field(
+                                        "Desde",
+                                        "report-from-popover",
+                                        "report-from-trigger",
+                                        self.from_date,
+                                        &self.from_calendar,
+                                        self.from_open,
+                                        true,
+                                        cx,
+                                    ))
+                                    .child(self.render_date_field(
+                                        "Hasta",
+                                        "report-to-popover",
+                                        "report-to-trigger",
+                                        self.to_date,
+                                        &self.to_calendar,
+                                        self.to_open,
+                                        false,
+                                        cx,
+                                    ))
                                     .child(
-                                        v_flex()
-                                            .w(px(160.0))
-                                            .gap(Spacing::XXS)
-                                            .child(
-                                                Label::new("Desde (YYYY-MM-DD)")
-                                                    .text_size(Typography::XS)
-                                                    .font_semibold()
-                                                    .text_color(palette.muted_foreground),
-                                            )
-                                            .child(
-                                                Input::new(&self.from_input)
-                                                    .small()
-                                                    .rounded(Radii::MD)
-                                                    .bg(palette.surface),
-                                            ),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .w(px(160.0))
-                                            .gap(Spacing::XXS)
-                                            .child(
-                                                Label::new("Hasta (YYYY-MM-DD)")
-                                                    .text_size(Typography::XS)
-                                                    .font_semibold()
-                                                    .text_color(palette.muted_foreground),
-                                            )
-                                            .child(
-                                                Input::new(&self.to_input)
-                                                    .small()
-                                                    .rounded(Radii::MD)
-                                                    .bg(palette.surface),
-                                            ),
-                                    )
-                                    .child(
-                                        AppButton::new("report-apply-range")
+                                        AppButton::new("report-last-seven-days")
                                             .secondary()
                                             .small()
-                                            .icon(IconName::Calendar)
-                                            .label("Aplicar rango")
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                view.apply_custom_range(cx);
+                                            .label("Últimos 7 días")
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.select_recent_days(7, window, cx);
                                             })),
                                     )
                                     .when(self.period != DatePeriodFilter::Today, |this| {
@@ -277,314 +364,122 @@ impl Render for ReportsView {
                                             AppButton::new("report-reset-period")
                                                 .tertiary()
                                                 .small()
-                                                .label("Limpiar filtros")
+                                                .label("Hoy")
                                                 .on_click(cx.listener(|view, _, window, cx| {
-                                                    view.apply_preset(
-                                                        DatePeriodFilter::Today,
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    view.select_recent_days(1, window, cx);
                                                 })),
                                         )
                                     }),
-                            )
-                            .when_some(self.filter_error.clone(), |this, message| {
-                                this.child(StatusBadge::new(StatusTone::Error, message))
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .flex_wrap()
-                            .gap(Spacing::MD)
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Breakfasts,
-                                    "Desayunos",
-                                    report.breakfasts.to_string(),
-                                )
-                                .icon(IconName::Sun)
-                                .subtitle(period_label.clone()),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Lunches,
-                                    "Almuerzos",
-                                    report.lunches.to_string(),
-                                )
-                                .icon(IconName::Calendar)
-                                .subtitle(period_label.clone()),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::Neutral,
-                                    "Raciones",
-                                    report.rations.to_string(),
-                                )
-                                .icon(IconName::ChartPie)
-                                .subtitle(format!(
-                                    "{} atenciones · {}",
-                                    report.attendances_count,
-                                    format_soles(report.consumption_cents)
-                                )),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::TicketsReceived,
-                                    "Tickets recibidos",
-                                    report.tickets_received.to_string(),
-                                )
-                                .icon(IconName::Info)
-                                    .subtitle(format!(
-                                        "{} abonos · {} · Efectivo {}",
-                                        report.cash_movements_count,
-                                        format_soles(report.ticket_amount_cents),
-                                        format_soles(report.cash_paid_cents),
-                                    )),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::CreditBalance,
-                                    "Saldo a favor",
-                                    format_soles(report.credit_balance_cents),
-                                )
-                                .icon(IconName::Check)
-                                .subtitle("Consolidado actual"),
-                            )
-                            .child(
-                                MetricCard::new(
-                                    MetricAccent::PendingDebt,
-                                    "Deuda pendiente",
-                                    format_soles(report.pending_debt_cents),
-                                )
-                                .icon(IconName::TriangleAlert)
-                                .subtitle("Consolidado actual"),
                             ),
                     )
                     .child(
-                        v_flex()
-                            .w_full()
-                            .gap(Spacing::MD)
-                            .p(card_padding)
-                            .rounded(Radii::LG)
-                            .bg(palette.surface)
-                            .border_1()
-                            .border_color(palette.border)
+                        h_flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap(Spacing::SM)
                             .child(
-                                Label::new("Resumen por pensionista en el periodo")
-                                    .text_size(Typography::LG)
-                                    .font_semibold()
-                                    .text_color(palette.foreground),
+                                Label::new("Actividad por día")
+                                    .text_size(Typography::XL)
+                                    .font_semibold(),
                             )
-                            .child(if by_pensioner.is_empty() {
-                                Label::new(
-                                    "No hay consumos ni abonos registrados en el periodo seleccionado.",
-                                )
-                                .text_size(Typography::SM)
-                                .text_color(palette.muted_foreground)
-                                .into_any_element()
-                            } else {
-                                v_flex()
-                                    .w_full()
-                                    .gap(Spacing::SM)
-                                    .children(by_pensioner.into_iter().map(|row| {
-                                        h_flex()
-                                            .w_full()
-                                            .flex_wrap()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(Spacing::SM)
-                                            .p(Spacing::MD)
-                                            .rounded(Radii::MD)
-                                            .bg(palette.surface_subtle)
-                                            .border_1()
-                                            .border_color(palette.border)
-                                            .child(
-                                                v_flex()
-                                                    .min_w_0()
-                                                    .gap(Spacing::XXS)
-                                                    .child(
-                                                        h_flex()
-                                                            .flex_wrap()
-                                                            .items_center()
-                                                            .gap(Spacing::SM)
-                                                            .child(
-                                                                Label::new(row.pensioner_name)
-                                                                    .text_size(Typography::BASE)
-                                                                    .font_semibold()
-                                                                    .text_color(palette.foreground),
-                                                            )
-                                                            .child(
-                                                                Label::new(row.pensioner_code)
-                                                                    .text_size(Typography::XS)
-                                                                    .font_medium()
-                                                                    .text_color(
-                                                                        palette.brand_accent,
-                                                                    ),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        Label::new(format!(
-                                                            "{} atenciones · {} des. / {} alm. ({}) · {} tickets ({})",
-                                                            row.attendances,
-                                                            row.breakfasts,
-                                                            row.lunches,
-                                                            format_soles(row.consumption_cents),
-                                                            row.tickets_count,
-                                                            format_soles(row.ticket_amount_cents),
-                                                        ))
-                                                        .text_size(Typography::XS)
-                                                        .text_color(palette.muted_foreground),
-                                                    ),
-                                            )
-                                            .child(
-                                                Label::new(format!(
-                                                    "Saldo actual: {}",
-                                                    format_soles(row.current_balance_cents)
-                                                ))
-                                                .text_size(Typography::SM)
-                                                .font_semibold()
-                                                .text_color(if row.current_balance_cents < 0 {
-                                                    palette.error.foreground
-                                                } else {
-                                                    palette.success.foreground
-                                                }),
-                                            )
-                                    }))
-                                    .into_any_element()
-                            }),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap(Spacing::MD)
-                            .p(card_padding)
-                            .rounded(Radii::LG)
-                            .bg(palette.surface)
-                            .border_1()
-                            .border_color(palette.border)
                             .child(
                                 h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(Spacing::SM)
-                                    .child(
-                                        Label::new("Detalle de consumos y tickets del periodo")
-                                            .text_size(Typography::LG)
-                                            .font_semibold()
-                                            .text_color(palette.foreground),
-                                    )
-                                    .child(
-                                        Label::new(format!(
-                                            "{} atenciones · {} abonos en caja",
-                                            attendances.len(),
-                                            movements.len()
-                                        ))
-                                        .text_size(Typography::XS)
-                                        .text_color(palette.muted_foreground),
-                                    ),
-                            )
-                            .child(if attendances.is_empty() {
-                                v_flex()
-                                    .w_full()
                                     .items_center()
                                     .gap(Spacing::XS)
-                                    .py(Spacing::LG)
-                                    .px(Spacing::MD)
-                                    .rounded(Radii::MD)
-                                    .bg(palette.surface_subtle)
-                                    .child(StatusBadge::new(
-                                        StatusTone::Neutral,
-                                        "Sin movimientos en este rango",
-                                    ))
+                                    .when(
+                                        daily_page.has_older_dates || daily_page.offset > 0,
+                                        |row| {
+                                            let offset = daily_page.offset;
+                                            row.child(
+                                                AppButton::new("reports-older-days")
+                                                    .secondary()
+                                                    .xsmall()
+                                                    .icon(IconName::ChevronLeft)
+                                                    .tooltip("Fechas anteriores")
+                                                    .disabled(!daily_page.has_older_dates)
+                                                    .on_click(cx.listener(
+                                                        move |view, _, _, cx| {
+                                                            view.daily_offset = offset + 1;
+                                                            view.load_daily(false, cx);
+                                                        },
+                                                    )),
+                                            )
+                                        },
+                                    )
                                     .child(
-                                        Label::new(
-                                            "Confirma una atención desde Buscar pensionista (Ctrl+K) o Identificación para verla reflejada aquí.",
-                                        )
-                                        .text_size(Typography::SM)
-                                        .text_center()
+                                        Label::new(if daily_page.from == daily_page.to {
+                                            to_naive_date(daily_page.to)
+                                                .format("%d/%m/%Y")
+                                                .to_string()
+                                        } else {
+                                            format!(
+                                                "{} – {}",
+                                                to_naive_date(daily_page.from).format("%d/%m/%Y"),
+                                                to_naive_date(daily_page.to).format("%d/%m/%Y")
+                                            )
+                                        })
+                                        .text_size(Typography::XS)
                                         .text_color(palette.muted_foreground),
                                     )
-                                    .into_any_element()
-                            } else {
-                                v_flex()
-                                    .w_full()
-                                    .gap(Spacing::SM)
-                                    .children(attendances.into_iter().map(|record| {
-                                        let kind_label = record.kind_label();
-                                        h_flex()
-                                            .w_full()
-                                            .flex_wrap()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(Spacing::SM)
-                                            .p(Spacing::MD)
-                                            .rounded(Radii::MD)
-                                            .bg(palette.surface_subtle)
-                                            .border_1()
-                                            .border_color(palette.border)
-                                            .child(
-                                                v_flex()
-                                                    .min_w_0()
-                                                    .gap(Spacing::XXS)
-                                                    .child(
-                                                        h_flex()
-                                                            .flex_wrap()
-                                                            .items_center()
-                                                            .gap(Spacing::SM)
-                                                            .child(
-                                                                Label::new(record.pensioner_name)
-                                                                    .text_size(Typography::SM)
-                                                                    .font_semibold()
-                                                                    .text_color(palette.foreground),
-                                                            )
-                                                            .child(
-                                                                Label::new(record.pensioner_code)
-                                                                    .text_size(Typography::XS)
-                                                                    .font_medium()
-                                                                    .text_color(
-                                                                        palette.brand_accent,
-                                                                    ),
-                                                            )
-                                                            .child(StatusBadge::new(
-                                                                StatusTone::Info,
-                                                                kind_label,
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Label::new(format!(
-                                                            "{} · Desayunos {} · Almuerzos {} ({}) · Tickets {} ({})",
-                                                            record.recorded_at,
-                                                            record.breakfasts,
-                                                            record.lunches,
-                                                            format_soles(record.consumption_cents),
-                                                            record.tickets_count,
-                                                            format_soles(
-                                                                record.ticket_amount_cents
-                                                            ),
-                                                        ))
-                                                        .text_size(Typography::XS)
-                                                        .text_color(palette.muted_foreground),
-                                                    ),
+                                    .when(
+                                        daily_page.has_older_dates || daily_page.offset > 0,
+                                        |row| {
+                                            let offset = daily_page.offset;
+                                            row.child(
+                                                AppButton::new("reports-newer-days")
+                                                    .secondary()
+                                                    .xsmall()
+                                                    .icon(IconName::ChevronRight)
+                                                    .tooltip("Fechas posteriores")
+                                                    .disabled(offset == 0)
+                                                    .on_click(cx.listener(
+                                                        move |view, _, _, cx| {
+                                                            view.daily_offset = offset - 1;
+                                                            view.load_daily(false, cx);
+                                                        },
+                                                    )),
                                             )
-                                            .child(
-                                                Label::new(format!(
-                                                    "Saldo: {}",
-                                                    format_soles(record.balance_after_cents)
-                                                ))
-                                                .text_size(Typography::XS)
-                                                .font_semibold()
-                                                .text_color(if record.balance_after_cents < 0 {
-                                                    palette.error.foreground
-                                                } else {
-                                                    palette.success.foreground
-                                                }),
-                                            )
-                                    }))
-                                    .into_any_element()
-                            }),
-                    ),
+                                        },
+                                    ),
+                            ),
+                    )
+                    .when_some(daily_charts, |view, charts| view.child(charts))
+                    .when_some(report_error, |view, error| {
+                        view.child(
+                            h_flex()
+                                .gap(Spacing::SM)
+                                .items_center()
+                                .child(Label::new(error))
+                                .child(
+                                    AppButton::new("reload-daily")
+                                        .secondary()
+                                        .small()
+                                        .label("Reintentar")
+                                        .on_click(
+                                            cx.listener(|view, _, _, cx| view.load_daily(true, cx)),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(is_loading, |view| {
+                        view.child(daily::loading_charts(compact, cx))
+                    }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CalendarDate, from_naive_date, normalize_range, to_naive_date};
+
+    #[test]
+    fn calendar_date_converts_cleanly_and_normalizes_inverted_ranges() {
+        let d1 = CalendarDate::new(2026, 11, 5).unwrap();
+        let d2 = CalendarDate::new(2026, 11, 24).unwrap();
+        assert_eq!(from_naive_date(to_naive_date(d1)), d1);
+        assert_eq!(from_naive_date(to_naive_date(d2)), d2);
+        assert_eq!(normalize_range(d1, d2), (d1, d2));
+        assert_eq!(normalize_range(d2, d1), (d2, d2));
     }
 }

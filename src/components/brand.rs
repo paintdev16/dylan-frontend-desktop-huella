@@ -1,102 +1,57 @@
+use std::sync::Arc;
+
 use gpui_kit::*;
 
-use crate::theme::visuals::AppVisuals;
+const DYLAN_SVG: &str = include_str!("../../assets/dylan.svg");
+const LOGO_VIEW: &str = r#"viewBox="150 84 500 410" width="500" height="410""#;
+const MARK_VIEW: &str = r#"viewBox="306 88 188 188" width="188" height="188""#;
 
-pub fn brand_tile(visuals: AppVisuals, side: Pixels) -> impl IntoElement {
+struct DylanBrand {
+    logo: Arc<RenderImage>,
+    mark: Arc<RenderImage>,
+}
+
+impl Global for DylanBrand {}
+
+pub fn init(cx: &mut App) {
+    let renderer = cx.svg_renderer();
+    let mark = DYLAN_SVG.replacen(LOGO_VIEW, MARK_VIEW, 1);
+    cx.set_global(DylanBrand {
+        logo: renderer
+            .render_single_frame(DYLAN_SVG.as_bytes(), 0.5)
+            .expect("El SVG de Dylan debe ser válido"),
+        mark: renderer
+            .render_single_frame(mark.as_bytes(), 0.5)
+            .expect("El isotipo de Dylan debe ser válido"),
+    });
+}
+
+pub fn dylan_logo(height: Pixels, cx: &App) -> impl IntoElement {
     div()
-        .flex()
+        .id("dylan-logo")
         .flex_shrink_0()
-        .items_center()
-        .justify_center()
-        .size(side)
-        .rounded(side * 0.25)
-        .bg(visuals.brand_background)
-        .border_1()
-        .border_color(visuals.brand_border)
-        .shadow(vec![
-            BoxShadow::new(px(0.0), side * 0.10, visuals.glow.alpha(0.48)).blur_radius(side * 0.28),
-        ])
+        .p(px(4.))
         .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, (), window, _| {
-                    paint_cutlery(window, bounds, visuals.brand_foreground, false);
-                },
-            )
-            .size(side * 0.62),
+            img(cx.global::<DylanBrand>().logo.clone())
+                .w(height * (500. / 410.))
+                .h(height),
         )
+        .role(Role::Image)
+        .aria_label("Dylan Restaurante")
 }
 
-pub fn paint_cutlery(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla, silhouette: bool) {
-    if silhouette {
-        paint_cutlery_silhouette_rotated(window, bounds, color, -0.14);
-    } else {
-        paint_cutlery_icon(window, bounds, color);
-    }
-}
-
-/// Silueta sólida continua rotada en radianes para patrones de fondo.
-pub fn paint_cutlery_silhouette_rotated(
-    window: &mut Window,
-    bounds: Bounds<Pixels>,
-    color: Hsla,
-    angle_rad: f32,
-) {
-    paint_cutlery_silhouette(window, bounds, color, angle_rad);
-}
-
-/// Icono limpio de tenedor y cuchara con trazo uniforme y puntas redondeadas.
-fn paint_cutlery_icon(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla) {
-    let at = |x: f32, y: f32| {
-        let x = bounds.size.width * (x - 0.5);
-        let y = bounds.size.height * (y - 0.5);
-        bounds.center() + point(x, y)
-    };
-    let stroke = bounds.size.width * 0.068;
-
-    let mut fork = PathBuilder::stroke(stroke);
-    // Diente izquierdo, base en U simétrica y diente derecho (sin barra horizontal interna)
-    fork.move_to(at(0.14, 0.12));
-    fork.line_to(at(0.14, 0.35));
-    fork.cubic_bezier_to(at(0.275, 0.50), at(0.14, 0.445), at(0.20, 0.50));
-    fork.cubic_bezier_to(at(0.41, 0.35), at(0.35, 0.50), at(0.41, 0.445));
-    fork.line_to(at(0.41, 0.12));
-    // Diente central continuo hasta el mango
-    fork.move_to(at(0.275, 0.12));
-    fork.line_to(at(0.275, 0.88));
-    if let Ok(path) = fork.build() {
-        window.paint_path(path, color);
-    }
-
-    let mut spoon = PathBuilder::stroke(stroke);
-    // Cuchara ovalada simétrica
-    spoon.move_to(at(0.725, 0.11));
-    spoon.cubic_bezier_to(at(0.86, 0.31), at(0.805, 0.11), at(0.86, 0.195));
-    spoon.cubic_bezier_to(at(0.725, 0.50), at(0.86, 0.43), at(0.80, 0.50));
-    spoon.cubic_bezier_to(at(0.59, 0.31), at(0.65, 0.50), at(0.59, 0.43));
-    spoon.cubic_bezier_to(at(0.725, 0.11), at(0.59, 0.195), at(0.645, 0.11));
-    spoon.close();
-    // Mango continuo desde la base de la cuchara
-    spoon.move_to(at(0.725, 0.50));
-    spoon.line_to(at(0.725, 0.88));
-    if let Ok(path) = spoon.build() {
-        window.paint_path(path, color);
-    }
-
-    // Remates redondeados exactos al grosor del trazo en los extremos abiertos
-    for tip in [
-        (0.14, 0.12),
-        (0.275, 0.12),
-        (0.41, 0.12),
-        (0.275, 0.88),
-        (0.725, 0.88),
-    ] {
-        paint_dot(window, at(tip.0, tip.1), stroke, color);
-    }
+pub fn dylan_mark(side: Pixels, cx: &App) -> impl IntoElement {
+    div()
+        .id("dylan-mark")
+        .flex_shrink_0()
+        .p(px(2.))
+        .child(img(cx.global::<DylanBrand>().mark.clone()).size(side))
+        .role(Role::Image)
+        .aria_label("Dylan Restaurante")
 }
 
 /// Silueta sólida continua (sin trazos ni círculos superpuestos) para el fondo decorativo.
-fn paint_cutlery_silhouette(
+pub fn paint_cutlery_silhouette_rotated(
     window: &mut Window,
     bounds: Bounds<Pixels>,
     color: Hsla,
@@ -146,10 +101,4 @@ fn paint_cutlery_silhouette(
     if let Ok(path) = spoon.build() {
         window.paint_path(path, color);
     }
-}
-
-pub fn paint_dot(window: &mut Window, center: Point<Pixels>, diameter: Pixels, color: Hsla) {
-    let radius = diameter * 0.5;
-    let bounds = Bounds::new(center - point(radius, radius), size(diameter, diameter));
-    window.paint_quad(fill(bounds, color).corner_radii(radius));
 }

@@ -19,7 +19,9 @@ fn main() {
 
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
+        gpui_kit::component::set_locale("es");
         theme::install_themes(cx);
+        components::brand::init(cx);
         cx.bind_keys([
             KeyBinding::new("f5", app::CheckForUpdates, None),
             KeyBinding::new("ctrl-k", app::FocusGlobalSearch, None),
@@ -29,6 +31,12 @@ fn main() {
         #[cfg(target_os = "linux")]
         {
             options.window_decorations = Some(WindowDecorations::Client);
+            let icon = image::load_from_memory_with_format(
+                include_bytes!("../assets/app.png"),
+                image::ImageFormat::Png,
+            )
+            .expect("El icono de Dylan debe ser un PNG válido");
+            options.icon = Some(std::sync::Arc::new(icon.into_rgba8()));
         }
         options.window_min_size = Some(size(px(360.0), px(360.0)));
         if let Some(titlebar) = &mut options.titlebar {

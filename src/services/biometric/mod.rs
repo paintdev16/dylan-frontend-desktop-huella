@@ -1,11 +1,14 @@
 #[cfg(target_os = "windows")]
 pub mod fdx;
 #[cfg(target_os = "windows")]
+pub(crate) mod sdk_paths;
+#[cfg(target_os = "windows")]
 pub mod secugen;
 #[cfg(target_os = "windows")]
 pub mod secusearch;
-pub mod simulator;
 pub mod storage;
+#[cfg(target_os = "windows")]
+pub mod usb;
 
 use std::{
     path::{Path, PathBuf},
@@ -13,39 +16,6 @@ use std::{
 };
 
 use crate::features::pensioners::model::PensionerId;
-
-/// Modo de lector biométrico seleccionable por estación.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BiometricBackendMode {
-    #[default]
-    Simulated,
-    SecuGen,
-}
-
-impl BiometricBackendMode {
-    pub const ALL: [Self; 2] = [Self::Simulated, Self::SecuGen];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Simulated => "Simulador biométrico",
-            Self::SecuGen => "SecuGen (FDx + SecuSearch)",
-        }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Simulated => "simulated",
-            Self::SecuGen => "secugen",
-        }
-    }
-
-    pub fn from_str(raw: &str) -> Self {
-        match raw.trim() {
-            "secugen" => Self::SecuGen,
-            _ => Self::Simulated,
-        }
-    }
-}
 
 /// Configuración no sensible de ubicaciones de SDK y respaldo cifrado por instalación.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +76,7 @@ impl BiometricError {
     }
 }
 
-/// Contrato común que implementan el simulador (desarrollo y Linux) y el adaptador
-/// real SecuGen (Windows, Etapa 5). Todas las llamadas potencialmente bloqueantes
-/// deben ejecutarse fuera del hilo de interfaz de GPUI.
+/// Contrato del lector biométrico. Las llamadas bloqueantes se ejecutan fuera de GPUI.
 #[allow(dead_code)]
 pub trait BiometricReader: Send + Sync {
     fn device_name(&self) -> String;

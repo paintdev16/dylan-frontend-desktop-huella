@@ -1,14 +1,7 @@
 use std::collections::VecDeque;
 
 use gpui_kit::{
-    component::{
-        Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, WindowExt as _,
-        button::Button,
-        h_flex,
-        label::Label,
-        menu::{DropdownMenu as _, PopupMenuItem},
-        v_flex,
-    },
+    component::{Icon, IconName, StyledExt as _, WindowExt as _, h_flex, label::Label, v_flex},
     prelude::FluentBuilder as _,
     *,
 };
@@ -16,25 +9,17 @@ use gpui_kit::{
 use crate::{
     components::{
         button::AppButton,
+        loading,
         status_badge::{StatusBadge, StatusTone},
     },
-    features::pensioners::model::{Pensioner, PensionerId, format_soles},
-    services::biometric::{BiometricBackendMode, simulator::SimulatedScenario},
+    features::pensioners::model::{PensionerId, format_soles},
     state::{
         reader::{ReaderState, ReaderStatus},
         session::{AppRoute, SessionState},
-        store::ComedorStore,
+        store::{ComedorStore, DataLoad},
     },
     theme::{ActiveDylanTheme as _, Radii, Spacing, Typography},
 };
-
-const FINGERPRINT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M2 12a10 10 0 0 1 18-6"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M9 6.8a6 6 0 0 1 9 5.2v2"/></svg>"#;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentificationEvent {
-    OpenPensioner(PensionerId),
-    FocusSearch,
-}
 
 const EVENT_LIMIT: usize = 8;
 
@@ -72,12 +57,9 @@ pub struct IdentificationView {
     session: Entity<SessionState>,
     reader: Entity<ReaderState>,
     history: IdentificationHistory,
-    simulation_target: Option<PensionerId>,
     modal_open: bool,
     _subscriptions: [Subscription; 3],
 }
-
-impl EventEmitter<IdentificationEvent> for IdentificationView {}
 
 impl IdentificationView {
     pub fn new(
@@ -105,7 +87,6 @@ impl IdentificationView {
         let observe_session = cx.observe(&session, |view, session, cx| {
             if !session.read(cx).can_access_route(AppRoute::Identification) {
                 view.history.reset(view.reader.read(cx).status());
-                view.simulation_target = None;
             }
             cx.notify();
         });
@@ -115,7 +96,6 @@ impl IdentificationView {
             session,
             reader,
             history,
-            simulation_target: None,
             modal_open: false,
             _subscriptions: [observe_reader, observe_store, observe_session],
         }
@@ -141,32 +121,30 @@ impl IdentificationView {
                 .can_access_route(AppRoute::Identification)
     }
 
-    fn simulate(&self, scenario: SimulatedScenario, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_start(window, cx) {
-            return;
-        }
-        if let SimulatedScenario::Match { pensioner_id, .. } = scenario
-            && !self
-                .store
-                .read(cx)
-                .ledger()
-                .find_pensioner(pensioner_id)
-                .is_some_and(simulation_candidate)
-        {
-            return;
-        }
-        self.reader.update(cx, |reader, cx| {
-            reader.simulate_identification(scenario, cx)
-        });
-    }
-
     fn render_reader(
         &self,
         status: &ReaderStatus,
-        simulated: bool,
+        can_reconnect: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let palette = cx.dylan_theme().palette;
+        if self.reader.read(cx).connection_loading() {
+            return panel("Estado del lector", cx).child(
+                loading::region("reader-status-loading", "Comprobando el lector biométrico")
+                    .w_full()
+                    .items_center()
+                    .p(Spacing::MD)
+                    .rounded(Radii::MD)
+                    .bg(palette.surface_subtle)
+                    .child(
+                        div()
+                            .w(px(76.))
+                            .child(loading::block("device-icon", px(76.))),
+                    )
+                    .child(loading::line("status", px(94.)))
+                    .child(loading::line("description", px(196.))),
+            );
+        }
         let tone = status_tone(status);
         let tint = match tone {
             StatusTone::Success => palette.success,
@@ -177,9 +155,6 @@ impl IdentificationView {
         };
         let detail = match status {
             ReaderStatus::Disconnected { reason } => reason.as_ref(),
-            ReaderStatus::Ready if simulated => {
-                "Elige un escenario del simulador para iniciar una lectura."
-            }
             ReaderStatus::Ready => "Inicia la lectura y coloca un dedo en el lector.",
             ReaderStatus::Capturing { .. } => "Esperando la respuesta del lector.",
             ReaderStatus::Matched { .. } => "La huella coincide con un pensionista.",
@@ -216,7 +191,7 @@ impl IdentificationView {
                             .bg(tint.tint)
                             .child(
                                 Icon::default()
-                                    .data(FINGERPRINT_SVG)
+                                    .data(include_bytes!("../../../assets/fingerprint.svg"))
                                     .size(px(38.))
                                     .text_color(tint.icon),
                             ),
@@ -241,23 +216,34 @@ impl IdentificationView {
                 h_flex()
                     .flex_wrap()
                     .gap(Spacing::SM)
-                    .when(
-                        !simulated && !status.is_disconnected() && !status.is_capturing(),
-                        |row| {
-                            row.child(
-                                AppButton::new("reader-start")
-                                    .label("Iniciar lectura")
-                                    .disabled(self.modal_open)
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        if view.can_start(window, cx) {
-                                            view.reader.update(cx, |reader, cx| {
-                                                reader.start_identification(cx)
-                                            });
-                                        }
-                                    })),
-                            )
-                        },
-                    )
+                    .when(status.is_disconnected() && can_reconnect, |row| {
+                        row.child(
+                            AppButton::new("reader-reconnect-inline")
+                                .primary()
+                                .icon(IconName::RefreshCw)
+                                .label("Reconectar lector")
+                                .disabled(self.modal_open)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    if view.can_start(window, cx) {
+                                        view.reader.update(cx, |reader, cx| reader.reconnect(cx));
+                                    }
+                                })),
+                        )
+                    })
+                    .when(!status.is_disconnected() && !status.is_capturing(), |row| {
+                        row.child(
+                            AppButton::new("reader-start")
+                                .label("Iniciar lectura")
+                                .disabled(self.modal_open)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    if view.can_start(window, cx) {
+                                        view.reader.update(cx, |reader, cx| {
+                                            reader.start_identification(cx)
+                                        });
+                                    }
+                                })),
+                        )
+                    })
                     .when(status.is_capturing() && !status.is_enrolling(), |row| {
                         row.child(
                             AppButton::new("reader-cancel")
@@ -269,169 +255,27 @@ impl IdentificationView {
                                         .update(cx, |reader, cx| reader.cancel_capture(cx));
                                 })),
                         )
-                    })
-                    .when(self.session.read(cx).can_search_pensioners(), |row| {
-                        row.child(
-                            AppButton::new("reader-search")
-                                .tertiary()
-                                .icon(IconName::Search)
-                                .label("Buscar pensionista")
-                                .disabled(self.modal_open)
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(IdentificationEvent::FocusSearch)
-                                })),
-                        )
                     }),
-            )
-    }
-
-    fn render_simulator(
-        &self,
-        status: &ReaderStatus,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let palette = cx.dylan_theme().palette;
-        let mut candidates: Vec<_> = self
-            .store
-            .read(cx)
-            .ledger()
-            .pensioners()
-            .iter()
-            .filter(|pensioner| simulation_candidate(pensioner))
-            .map(|pensioner| (pensioner.id, pensioner.full_name.clone()))
-            .collect();
-        candidates.sort_by_key(|(id, _)| *id);
-        let target = candidates
-            .iter()
-            .find(|(id, _)| Some(*id) == self.simulation_target)
-            .or(candidates.first());
-        let target_id = target.map(|(id, _)| *id);
-        let target_name = target.map(|(_, name)| name.clone());
-        let disabled = self.modal_open || status.is_capturing() || status.is_disconnected();
-        let owner = cx.weak_entity();
-        let modes = [
-            (
-                "sim-no-match",
-                "Simular huella no reconocida",
-                SimulatedScenario::Unrecognized { delay_ms: 450 },
-            ),
-            (
-                "sim-error",
-                "Simular desconexión",
-                SimulatedScenario::DisconnectDuringCapture { delay_ms: 450 },
-            ),
-        ];
-        panel("Simulador biométrico", cx)
-            .child(
-                h_flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap(Spacing::SM)
-                    .when_some(target_name, |row, name| {
-                        row.child(Label::new(name).text_size(Typography::SM).font_medium())
-                            .child(
-                                Button::new("sim-target")
-                                    .small()
-                                    .label("Cambiar pensionista")
-                                    .dropdown_caret(true)
-                                    .when(disabled, |button| button.disabled(true))
-                                    .dropdown_menu_with_anchor(
-                                        Anchor::TopLeft,
-                                        move |mut menu, _, _| {
-                                            for (id, name) in &candidates {
-                                                let id = *id;
-                                                let owner = owner.clone();
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(name.clone())
-                                                        .checked(Some(id) == target_id)
-                                                        .on_click(move |_, _, cx| {
-                                                            let _ = owner.update(cx, |view, cx| {
-                                                                view.simulation_target = Some(id);
-                                                                cx.notify();
-                                                            });
-                                                        }),
-                                                );
-                                            }
-                                            menu
-                                        },
-                                    ),
-                            )
-                    }),
-            )
-            .when(target_id.is_none(), |card| {
-                card.child(
-                    Label::new("No hay pensionistas activos con huella registrada.")
-                        .text_size(Typography::SM)
-                        .text_color(palette.muted_foreground),
-                )
-            })
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap(Spacing::SM)
-                    .when_some(target_id, |row, id| {
-                        row.child(
-                            AppButton::new("sim-match")
-                                .small()
-                                .label("Simular huella reconocida")
-                                .disabled(disabled)
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.simulate(
-                                        SimulatedScenario::Match {
-                                            pensioner_id: id,
-                                            delay_ms: 450,
-                                        },
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .child(
-                            AppButton::new("sim-slow")
-                                .small()
-                                .tertiary()
-                                .label("Simular lectura lenta")
-                                .disabled(disabled)
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.simulate(
-                                        SimulatedScenario::Match {
-                                            pensioner_id: id,
-                                            delay_ms: 2000,
-                                        },
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .children(modes.map(|(id, label, scenario)| {
-                        AppButton::new(id)
-                            .small()
-                            .secondary()
-                            .label(label)
-                            .disabled(disabled)
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.simulate(scenario, window, cx)
-                            }))
-                    })),
             )
     }
 
     fn render_last_match(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let palette = cx.dylan_theme().palette;
-        let session = self.session.read(cx);
-        let can_view = session.can_access_route(AppRoute::Pensioners);
-        let ledger = self.store.read(cx).ledger();
-        let pensioner = self
-            .history
-            .last_match
-            .and_then(|id| ledger.find_pensioner(id));
+        let store = self.store.read(cx);
+        let ledger = store.ledger();
+        let last_match = self.history.last_match;
+        let identified = last_match.and_then(|id| store.identified_pensioner(id));
+        let identified_profile = identified.and_then(|query| query.value.as_ref());
+        let pensioner =
+            identified_profile.or_else(|| last_match.and_then(|id| ledger.find_pensioner(id)));
+        let profile_loading = identified.is_some_and(|query| query.status() == DataLoad::Loading)
+            || last_match
+                .and_then(|id| store.pensioner_history(id))
+                .is_some_and(|query| query.status() == DataLoad::Loading);
         let can_clear = self.history.last_match.is_some()
             && !self.modal_open
             && !self.reader.read(cx).status().is_capturing();
         let content = if let Some(pensioner) = pensioner {
-            let id = pensioner.id;
-            let balance = pensioner.balance_cents;
             v_flex()
                 .gap(Spacing::SM)
                 .child(
@@ -458,38 +302,36 @@ impl IdentificationView {
                         )),
                 )
                 .child(
-                    Label::new(format!(
-                        "{} · {}",
-                        pensioner.code(),
-                        if balance < 0 {
-                            format!("Deuda pendiente: {}", format_soles(pensioner.debt_cents()))
-                        } else if balance > 0 {
-                            format!("Saldo a favor: {}", format_soles(balance))
-                        } else {
-                            "Al día".into()
-                        }
-                    ))
-                    .text_size(Typography::SM)
-                    .text_color(palette.muted_foreground),
+                    Label::new(pensioner.code())
+                        .text_size(Typography::SM)
+                        .text_color(palette.muted_foreground),
                 )
-                .when(can_view, |card| {
+                .when_some(identified_profile, |card, profile| {
                     card.child(
-                        h_flex().child(
-                            AppButton::new("bio-open-profile")
-                                .secondary()
-                                .small()
-                                .label("Ver ficha")
-                                .disabled(self.modal_open)
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(IdentificationEvent::OpenPensioner(id))
-                                })),
-                        ),
+                        Label::new(format!(
+                            "Saldo actual: {}",
+                            format_soles(profile.balance_cents)
+                        ))
+                        .text_size(Typography::SM)
+                        .font_semibold(),
                     )
                 })
                 .into_any_element()
+        } else if self.history.last_match.is_some()
+            && (self.modal_open || profile_loading || store.pensioners_load() == DataLoad::Loading)
+        {
+            loading::region(
+                "last-identification-loading",
+                "Cargando el pensionista identificado",
+            )
+            .child(loading::line("name", px(180.)))
+            .child(loading::line("code", px(86.)))
+            .into_any_element()
         } else {
             Label::new(if self.history.last_match.is_some() {
-                "La huella coincide con un código que no está en el padrón."
+                identified
+                    .and_then(|query| query.error.as_deref())
+                    .unwrap_or("No se pudo obtener la ficha asociada a esta huella.")
             } else {
                 "Todavía no hay una huella reconocida."
             })
@@ -537,7 +379,7 @@ impl Render for IdentificationView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = cx.dylan_theme().palette;
         let reader = self.reader.read(cx);
-        let simulated = reader.backend_mode() == BiometricBackendMode::Simulated;
+        let can_reconnect = reader.can_reconnect();
         let status = reader.status().clone();
         let device = reader.device_name();
         let disconnected = status.is_disconnected();
@@ -548,10 +390,9 @@ impl Render for IdentificationView {
             Spacing::XL
         };
         let wide = width >= px(1080.);
-        let reader_panel = self.render_reader(&status, simulated, cx);
+        let reader_panel = self.render_reader(&status, can_reconnect, cx);
         let last_match = self.render_last_match(cx);
         let events = self.render_events(cx);
-        let simulator = simulated.then(|| self.render_simulator(&status, cx));
         let columns = div()
             .flex()
             .when(wide, |d| d.flex_row())
@@ -565,8 +406,7 @@ impl Render for IdentificationView {
                     .flex_1()
                     .min_w_0()
                     .gap(Spacing::LG)
-                    .child(reader_panel)
-                    .children(simulator),
+                    .child(reader_panel),
             )
             .child(
                 v_flex()
@@ -623,7 +463,9 @@ impl Render for IdentificationView {
                                         } else {
                                             "Desconectar"
                                         })
-                                        .disabled(self.modal_open)
+                                        .disabled(
+                                            self.modal_open || (disconnected && !can_reconnect),
+                                        )
                                         .on_click(cx.listener(|view, _, window, cx| {
                                             if view.can_start(window, cx) {
                                                 view.reader.update(cx, |reader, cx| {
@@ -641,10 +483,6 @@ impl Render for IdentificationView {
                     .child(columns),
             )
     }
-}
-
-fn simulation_candidate(pensioner: &Pensioner) -> bool {
-    pensioner.active && pensioner.fingerprint_enrolled
 }
 
 fn panel(title: &'static str, cx: &App) -> Div {

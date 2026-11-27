@@ -20,9 +20,13 @@ use gpui_kit::{
 use crate::{
     components::{
         button::AppButton,
+        loading,
         status_badge::{StatusBadge, StatusTone},
     },
-    state::{reader::ReaderState, session::SessionState, store::ComedorStore},
+    state::{
+        session::SessionState,
+        store::{ComedorStore, DataLoad},
+    },
     theme::{ActiveDylanTheme as _, Radii, Spacing, Typography},
 };
 
@@ -44,7 +48,7 @@ impl SelectionSource {
         match self {
             Self::GlobalSearch => "Buscador global",
             Self::ManualSearch => "Listado Pensionistas",
-            Self::BiometricMatch => "Huella simulada",
+            Self::BiometricMatch => "Huella",
         }
     }
 }
@@ -66,7 +70,6 @@ pub struct PensionersView {
     focus: FocusHandle,
     store: Entity<ComedorStore>,
     session: Entity<SessionState>,
-    reader: Entity<ReaderState>,
     search_input: Entity<InputState>,
     table: Entity<TableState<PensionersTable>>,
     filter: PensionerFilter,
@@ -80,14 +83,12 @@ impl PensionersView {
     pub fn new(
         store: Entity<ComedorStore>,
         session: Entity<SessionState>,
-        reader: Entity<ReaderState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
         let search_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Buscar por nombre, DNI, código, celular o plan…")
+            InputState::new(window, cx).placeholder("Buscar por nombre, DNI, código o celular…")
         });
         let rows = store.read(cx).ledger().pensioners().to_vec();
         let owner = cx.weak_entity();
@@ -111,7 +112,6 @@ impl PensionersView {
             focus,
             store,
             session,
-            reader,
             search_input,
             table,
             filter: PensionerFilter::All,
@@ -129,6 +129,19 @@ impl PensionersView {
             self.selected = selected;
             cx.notify();
         }
+    }
+
+    pub fn load_data(&self, force: bool, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            if let Some(selected) = self
+                .selected
+                .filter(|selected| store.ledger().find_pensioner(selected.id).is_some())
+            {
+                store.load_pensioner_history(selected.id, force, cx);
+            } else {
+                store.load_pensioners(force, cx);
+            }
+        });
     }
 
     pub fn reset_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -164,7 +177,9 @@ impl PensionersView {
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = cx.dylan_theme().palette;
         let count = self.table.read(cx).delegate().len();
-        let total = self.store.read(cx).ledger().pensioners().len();
+        let store = self.store.read(cx);
+        let total = store.ledger().pensioners().len();
+        let load = store.pensioners_load();
         let permissions = self.session.read(cx).pensioner_permissions();
         let filtered = self.filter != PensionerFilter::All
             || !self.search_input.read(cx).value().trim().is_empty();
@@ -187,11 +202,16 @@ impl PensionersView {
                                     .text_size(Typography::PAGE_TITLE)
                                     .font_bold(),
                             )
-                            .child(
-                                Label::new(format!("{count} de {total} pensionistas"))
-                                    .text_size(Typography::SM)
-                                    .text_color(palette.muted_foreground),
-                            ),
+                            .when(load == DataLoad::Ready, |header| {
+                                header.child(
+                                    Label::new(format!("{count} de {total} pensionistas"))
+                                        .text_size(Typography::SM)
+                                        .text_color(palette.muted_foreground),
+                                )
+                            })
+                            .when(load == DataLoad::Loading, |header| {
+                                header.child(loading::line("pensioner-count-loading", px(132.)))
+                            }),
                     )
                     .when(permissions.create, |header| {
                         header.child(
@@ -256,13 +276,30 @@ impl PensionersView {
                             }),
                     )
                     .child(
-                        div().flex_1().min_h_0().min_w_0().child(
-                            DataTable::new(&self.table)
+                        div().flex_1().min_h_0().min_w_0().child(match load {
+                            DataLoad::Loading => div()
+                                .p(Spacing::MD)
+                                .child(loading::rows(
+                                    "pensioner-list-loading",
+                                    "Cargando pensionistas",
+                                    5,
+                                    cx,
+                                ))
+                                .into_any_element(),
+                            DataLoad::Failed => div()
+                                .p(Spacing::MD)
+                                .child(
+                                    Label::new("No se pudo cargar el listado de pensionistas.")
+                                        .text_color(palette.muted_foreground),
+                                )
+                                .into_any_element(),
+                            DataLoad::Idle | DataLoad::Ready => DataTable::new(&self.table)
                                 .large()
                                 .accessibility_label("Listado de pensionistas")
                                 .bordered(false)
-                                .scrollbar_visible(true, true),
-                        ),
+                                .scrollbar_visible(true, true)
+                                .into_any_element(),
+                        }),
                     ),
             )
     }
@@ -314,7 +351,6 @@ fn profile_metadata(pensioner: &Pensioner) -> Vec<String> {
     [
         (!pensioner.dni.is_empty()).then(|| format!("DNI {}", pensioner.dni)),
         pensioner.phone.clone(),
-        (!pensioner.plan.is_empty()).then(|| pensioner.plan.clone()),
     ]
     .into_iter()
     .flatten()
